@@ -14,6 +14,8 @@ export HYDRA_FULL_ERROR=1
 cd /workspace/opd1/verl
 
 TRAIN_FILE="/workspace/opd1/verl/train-00000-of-00001.parquet"
+CKPT_DIR="/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K"
+POST_TRAIN_EVAL=${POST_TRAIN_EVAL:-1}
 
 AIME24_JSONL="/workspace/opd1/data/aime24/test.jsonl"
 AIME24_PARQUET="/workspace/opd1/data/aime24/test_verl.parquet"
@@ -120,6 +122,7 @@ python3 -m verl.trainer.main_ppo \
         +data.apply_chat_template_kwargs.enable_thinking=False \
         actor_rollout_ref.model.path=/workspace/models/Qwen3-1.7B \
         +actor_rollout_ref.ref.model.path=/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500 \
+        actor_rollout_ref.actor.checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
         actor_rollout_ref.actor.optim.lr=2e-6 \
         actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
         actor_rollout_ref.model.use_remove_padding=True \
@@ -160,9 +163,31 @@ python3 -m verl.trainer.main_ppo \
         trainer.n_gpus_per_node=2 \
         trainer.nnodes=1 \
         trainer.save_freq=50 \
-        trainer.default_local_dir=/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K \
+        trainer.default_local_dir="$CKPT_DIR" \
         trainer.max_actor_ckpt_to_keep=1 \
         trainer.max_critic_ckpt_to_keep=1 \
         trainer.test_freq=10 \
         trainer.total_epochs=1 \
         "$@"
+
+if [ "$POST_TRAIN_EVAL" = "1" ]; then
+    latest_step_file="${CKPT_DIR}/latest_checkpointed_iteration.txt"
+    if [ ! -f "$latest_step_file" ]; then
+        echo "ERROR: latest checkpoint step file not found: $latest_step_file"
+        exit 1
+    fi
+
+    latest_step=$(tr -d '[:space:]' < "$latest_step_file")
+    hf_model_path="${CKPT_DIR}/global_step_${latest_step}/actor/huggingface"
+
+    if [ ! -d "$hf_model_path" ]; then
+        echo "ERROR: HuggingFace checkpoint not found: $hf_model_path"
+        echo "Check that actor_rollout_ref.actor.checkpoint.save_contents includes hf_model."
+        exit 1
+    fi
+
+    cd /workspace/opd1/math_eval
+    MODEL_PATH="$hf_model_path" \
+    MODEL_NAME="Qwen3-1.7B-Standard-OPD-DAPO-Math-17K-global_step_${latest_step}" \
+        bash run_eval_math.sh
+fi

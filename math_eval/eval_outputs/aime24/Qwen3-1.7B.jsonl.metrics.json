@@ -1,0 +1,12 @@
+{
+  "dataset": "../data/aime24/test.jsonl",
+  "model": "Qwen3-1.7B",
+  "k": 16,
+  "AVG@16": 0.12083333333333333,
+  "P@16": 0.4,
+  "total_predictions": 480,
+  "accurate_predictions": 58,
+  "num_problems": 30,
+  "avg_length": 2712.545833333333,
+  "max_tokens": 16384
+}

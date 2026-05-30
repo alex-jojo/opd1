@@ -86,7 +86,7 @@ def main():
     parser.add_argument('--input_file', type=str, required=True)
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument("--output_file", type=str, required=True)
-    parser.add_argument("--max_tokens", type=int, default=512)
+    parser.add_argument("--max_tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--max_num_seqs", type=int, default=32)
@@ -175,18 +175,40 @@ def main():
             length = len(toker.encode(response, add_special_tokens=False))
             avg_length += length / len(responses)
 
-    accuracy = correct_preds / total_preds if total_preds > 0 else 0.0
-    pass_at_k  = pass_at_k / len(res_data) if len(res_data) > 0 else 0.0
+    avg_at_k = correct_preds / total_preds if total_preds > 0 else 0.0
+    pass_at_k = pass_at_k / len(res_data) if len(res_data) > 0 else 0.0
     avg_length = avg_length / len(res_data) if len(res_data) > 0 else 0.0
+    metric_k = args.n
+    metrics = {
+        "dataset": args.input_file,
+        "model": args.model_name,
+        "k": metric_k,
+        f"AVG@{metric_k}": avg_at_k,
+        f"P@{metric_k}": pass_at_k,
+        "total_predictions": total_preds,
+        "accurate_predictions": correct_preds,
+        "num_problems": len(res_data),
+        "avg_length": avg_length,
+        "max_tokens": args.max_tokens,
+    }
+
     print(f"dataset: {args.input_file}")
     print(f"Total predictions: {total_preds}")
     print(f"Accurate predictions: {correct_preds}")
-    print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"passs@k: {pass_at_k:.4f}")
+    print(f"AVG@{metric_k}: {avg_at_k:.4f} ({avg_at_k*100:.2f}%)")
+    print(f"P@{metric_k}: {pass_at_k:.4f} ({pass_at_k*100:.2f}%)")
     print(f"avg_length: {avg_length:.4f}")
+    print(f"max_tokens: {args.max_tokens}")
+
     with open(args.output_file, "w", encoding="utf-8") as file:
         for d in res_data:
             file.write(json.dumps(d) + "\n")
+
+    metrics_file = args.output_file + ".metrics.json"
+    with open(metrics_file, "w", encoding="utf-8") as file:
+        json.dump(metrics, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    print(f"metrics_file: {metrics_file}")
 
 
 if __name__ == '__main__':
