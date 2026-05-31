@@ -3,98 +3,202 @@ set -x
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export WANDB_API_KEY='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'
 
-export WANDB_API_KEY=${WANDB_API_KEY:-""}
-export WANDB_MODE=${WANDB_MODE:-online}
-export USED_MODEL=${USED_MODEL:-"no_api"}
+export WANDB_MODE=online
+export USED_MODEL="no_api"
 export RAY_DISABLE_DOCKER_CPU_WARNING=1
 export HYDRA_FULL_ERROR=1
 
 cd /workspace/opd1/verl
 
-TRAIN_FILE="/workspace/opd1/verl/train-00000-of-00001.parquet"
-CKPT_DIR="/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K"
-POST_TRAIN_EVAL=${POST_TRAIN_EVAL:-1}
+TRAIN_SRC="/workspace/opd1/verl/train-00000-of-00001.parquet"
+TRAIN_FILE="/workspace/opd1/verl/train_verl.parquet"
 
 AIME24_JSONL="/workspace/opd1/data/aime24/test.jsonl"
 AIME24_PARQUET="/workspace/opd1/data/aime24/test_verl.parquet"
 
-if [ ! -f "$TRAIN_FILE" ]; then
-    echo "ERROR: training file not found: $TRAIN_FILE"
+STUDENT_MODEL="/workspace/models/Qwen3-1.7B"
+TEACHER_MODEL="/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500"
+
+if [ ! -f "$TRAIN_SRC" ]; then
+    echo "ERROR: training file not found: $TRAIN_SRC"
     exit 1
 fi
 
-if [ ! -f "$AIME24_PARQUET" ]; then
-    if [ ! -f "$AIME24_JSONL" ]; then
-        echo "ERROR: AIME24 jsonl not found: $AIME24_JSONL"
-        exit 1
-    fi
+if [ ! -f "$AIME24_JSONL" ]; then
+    echo "ERROR: AIME24 jsonl not found: $AIME24_JSONL"
+    exit 1
+fi
 
-    python3 - <<PY
+if [ ! -d "$STUDENT_MODEL" ]; then
+    mkdir -p /workspace/models
+    huggingface-cli download Qwen/Qwen3-1.7B \
+        --local-dir "$STUDENT_MODEL" \
+        --local-dir-use-symlinks False
+fi
+
+if [ ! -d "$TEACHER_MODEL" ]; then
+    mkdir -p /workspace/models
+    huggingface-cli download Keven16/Qwen3-4B-Non-Thinking-RL-Math-Step500 \
+        --local-dir "$TEACHER_MODEL" \
+        --local-dir-use-symlinks False
+fi
+
+python3 - <<PY
+import os
+import wandb
+
+key = os.environ.get("WANDB_API_KEY")
+if not key:
+    raise RuntimeError("WANDB_API_KEY is empty")
+wandb.login(key=key, relogin=True)
+PY
+
+python3 - <<'PY'
 import json
-import pandas as pd
 from pathlib import Path
 
-src = Path("$AIME24_JSONL")
-dst = Path("$AIME24_PARQUET")
+import pandas as pd
 
-rows = []
-with src.open("r", encoding="utf-8") as f:
-    for i, line in enumerate(f):
-        if not line.strip():
-            continue
-        x = json.loads(line)
 
-        problem = (
-            x.get("prompt")
-            or x.get("problem")
-            or x.get("question")
-            or x.get("input")
-            or x.get("query")
-        )
+def pick_text(x):
+    return (
+        x.get("prompt")
+        or x.get("problem")
+        or x.get("question")
+        or x.get("input")
+        or x.get("query")
+    )
 
-        answer = (
-            x.get("answer")
-            or x.get("final_answer")
-            or x.get("target")
-            or x.get("gt")
-            or x.get("ground_truth")
-        )
+
+def pick_answer(x):
+    return (
+        x.get("answer")
+        or x.get("final_answer")
+        or x.get("target")
+        or x.get("gt")
+        or x.get("ground_truth")
+        or x.get("solution")
+    )
+
+
+def normalize_prompt(v):
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        return [{"role": "user", "content": v}]
+    return [{"role": "user", "content": str(v)}]
+
+
+def normalize_parquet(src, dst, data_source, split):
+    src = Path(src)
+    dst = Path(dst)
+
+    df = pd.read_parquet(src)
+    rows = []
+
+    for i, row in df.iterrows():
+        x = row.to_dict()
+
+        problem = pick_text(x)
+        answer = pick_answer(x)
 
         if problem is None:
-            raise KeyError(f"row {i} has no prompt/problem/question/input/query field, keys={list(x.keys())}")
+            raise KeyError(f"{src} row {i} has no prompt/problem/question/input/query field. keys={list(x.keys())}")
 
-        rows.append({
-            "data_source": "aime24",
-            "prompt": [
-                {
-                    "role": "user",
-                    "content": str(problem),
-                }
-            ],
-            "ability": "math",
-            "reward_model": {
+        reward_model = x.get("reward_model")
+        if not isinstance(reward_model, dict):
+            reward_model = {
                 "style": "rule",
                 "ground_truth": "" if answer is None else str(answer),
-            },
-            "extra_info": {
-                "split": "test",
-                "index": i,
-                "answer": "" if answer is None else str(answer),
-            },
+            }
+
+        extra_info = x.get("extra_info")
+        if not isinstance(extra_info, dict):
+            extra_info = {}
+
+        extra_info.update({
+            "split": split,
+            "index": int(i),
+            "answer": "" if answer is None else str(answer),
         })
 
-df = pd.DataFrame(rows)
-print(df.head())
-print("rows:", len(df))
-print("columns:", list(df.columns))
+        rows.append({
+            "data_source": x.get("data_source", data_source),
+            "prompt": normalize_prompt(problem),
+            "ability": x.get("ability", "math"),
+            "reward_model": reward_model,
+            "extra_info": extra_info,
+        })
 
-dst.parent.mkdir(parents=True, exist_ok=True)
-df.to_parquet(dst, index=False)
-print("saved:", dst)
+    out = pd.DataFrame(rows)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(dst, index=False)
+
+    print("saved:", dst)
+    print("rows:", len(out))
+    print("columns:", list(out.columns))
+    print(out.head(1).to_dict("records")[0])
+
+
+def normalize_jsonl(src, dst, data_source, split):
+    src = Path(src)
+    dst = Path(dst)
+
+    rows = []
+    with src.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if not line.strip():
+                continue
+
+            x = json.loads(line)
+            problem = pick_text(x)
+            answer = pick_answer(x)
+
+            if problem is None:
+                raise KeyError(f"{src} row {i} has no prompt/problem/question/input/query field. keys={list(x.keys())}")
+
+            rows.append({
+                "data_source": data_source,
+                "prompt": normalize_prompt(problem),
+                "ability": "math",
+                "reward_model": {
+                    "style": "rule",
+                    "ground_truth": "" if answer is None else str(answer),
+                },
+                "extra_info": {
+                    "split": split,
+                    "index": i,
+                    "answer": "" if answer is None else str(answer),
+                },
+            })
+
+    out = pd.DataFrame(rows)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(dst, index=False)
+
+    print("saved:", dst)
+    print("rows:", len(out))
+    print("columns:", list(out.columns))
+    print(out.head(1).to_dict("records")[0])
+
+
+normalize_parquet(
+    "/workspace/opd1/verl/train-00000-of-00001.parquet",
+    "/workspace/opd1/verl/train_verl.parquet",
+    data_source="dapo_math_17k",
+    split="train",
+)
+
+normalize_jsonl(
+    "/workspace/opd1/data/aime24/test.jsonl",
+    "/workspace/opd1/data/aime24/test_verl.parquet",
+    data_source="aime24",
+    split="test",
+)
 PY
-fi
 
 test_files="['$AIME24_PARQUET']"
 
@@ -113,17 +217,17 @@ python3 -m verl.trainer.main_ppo \
         data.val_files="$test_files" \
         data.train_batch_size=128 \
         data.max_prompt_length=2048 \
-        data.max_response_length=16384 \
+        data.max_response_length=8192 \
         data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.shuffle=True \
         data.seed=42 \
         data.return_raw_chat=True \
         +data.apply_chat_template_kwargs.enable_thinking=False \
-        actor_rollout_ref.model.path=/workspace/models/Qwen3-1.7B \
-        +actor_rollout_ref.ref.model.path=/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500 \
-        actor_rollout_ref.actor.checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
+        actor_rollout_ref.model.path="$STUDENT_MODEL" \
+        +actor_rollout_ref.ref.model.path="$TEACHER_MODEL" \
         actor_rollout_ref.actor.optim.lr=2e-6 \
+        data.filter_overlong_prompts_workers=4 \
         actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True \
@@ -138,7 +242,7 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.actor.fsdp_config.param_offload=False \
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-        actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+        actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
         actor_rollout_ref.rollout.name=vllm \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
         actor_rollout_ref.rollout.n=1 \
@@ -160,34 +264,12 @@ python3 -m verl.trainer.main_ppo \
         trainer.log_val_generations=10 \
         trainer.project_name='on-policy-distillation' \
         trainer.experiment_name='qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_standard_opd_dapo_math_17k' \
-        trainer.n_gpus_per_node=2 \
+        trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
         trainer.save_freq=50 \
-        trainer.default_local_dir="$CKPT_DIR" \
+        trainer.default_local_dir=/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K \
         trainer.max_actor_ckpt_to_keep=1 \
         trainer.max_critic_ckpt_to_keep=1 \
         trainer.test_freq=10 \
         trainer.total_epochs=1 \
         "$@"
-
-if [ "$POST_TRAIN_EVAL" = "1" ]; then
-    latest_step_file="${CKPT_DIR}/latest_checkpointed_iteration.txt"
-    if [ ! -f "$latest_step_file" ]; then
-        echo "ERROR: latest checkpoint step file not found: $latest_step_file"
-        exit 1
-    fi
-
-    latest_step=$(tr -d '[:space:]' < "$latest_step_file")
-    hf_model_path="${CKPT_DIR}/global_step_${latest_step}/actor/huggingface"
-
-    if [ ! -d "$hf_model_path" ]; then
-        echo "ERROR: HuggingFace checkpoint not found: $hf_model_path"
-        echo "Check that actor_rollout_ref.actor.checkpoint.save_contents includes hf_model."
-        exit 1
-    fi
-
-    cd /workspace/opd1/math_eval
-    MODEL_PATH="$hf_model_path" \
-    MODEL_NAME="Qwen3-1.7B-Standard-OPD-DAPO-Math-17K-global_step_${latest_step}" \
-        bash run_eval_math.sh
-fi
