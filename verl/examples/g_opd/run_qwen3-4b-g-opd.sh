@@ -18,6 +18,16 @@ TRAIN_FILE="/workspace/opd1/verl/train_verl.parquet"
 
 AIME24_JSONL="/workspace/opd1/data/aime24/test.jsonl"
 AIME24_PARQUET="/workspace/opd1/data/aime24/test_verl.parquet"
+AIME25_JSONL="/workspace/opd1/data/aime25/test.jsonl"
+AIME25_PARQUET="/workspace/opd1/data/aime25/test_verl.parquet"
+AIME26_JSONL="/workspace/opd1/data/aime26/test.jsonl"
+AIME26_PARQUET="/workspace/opd1/data/aime26/test_verl.parquet"
+HMMT26_JSONL="/workspace/opd1/data/hmmt26/test.jsonl"
+HMMT26_PARQUET="/workspace/opd1/data/hmmt26/test_verl.parquet"
+AMC23_JSONL="/workspace/opd1/data/amc23/test.jsonl"
+AMC23_PARQUET="/workspace/opd1/data/amc23/test_verl.parquet"
+MATH500_JSONL="/workspace/opd1/data/math500/test.jsonl"
+MATH500_PARQUET="/workspace/opd1/data/math500/test_verl.parquet"
 
 STUDENT_MODEL="/workspace/models/Qwen3-1.7B"
 TEACHER_MODEL="/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500"
@@ -27,10 +37,23 @@ if [ ! -f "$TRAIN_SRC" ]; then
     exit 1
 fi
 
-if [ ! -f "$AIME24_JSONL" ]; then
-    echo "ERROR: AIME24 jsonl not found: $AIME24_JSONL"
-    exit 1
-fi
+EVAL_JSONLS=(
+    "AIME24:$AIME24_JSONL"
+    "AIME25:$AIME25_JSONL"
+    "AIME26:$AIME26_JSONL"
+    "HMMT26:$HMMT26_JSONL"
+    "AMC23:$AMC23_JSONL"
+    "MATH500:$MATH500_JSONL"
+)
+
+for item in "${EVAL_JSONLS[@]}"; do
+    name="${item%%:*}"
+    jsonl="${item#*:}"
+    if [ ! -f "$jsonl" ]; then
+        echo "ERROR: ${name} jsonl not found: $jsonl"
+        exit 1
+    fi
+done
 
 if [ ! -d "$STUDENT_MODEL" ]; then
     mkdir -p /workspace/models
@@ -198,9 +221,60 @@ normalize_jsonl(
     data_source="aime24",
     split="test",
 )
+
+normalize_jsonl(
+    "/workspace/opd1/data/aime25/test.jsonl",
+    "/workspace/opd1/data/aime25/test_verl.parquet",
+    data_source="aime25",
+    split="test",
+)
+
+normalize_jsonl(
+    "/workspace/opd1/data/aime26/test.jsonl",
+    "/workspace/opd1/data/aime26/test_verl.parquet",
+    data_source="aime26",
+    split="test",
+)
+
+normalize_jsonl(
+    "/workspace/opd1/data/hmmt26/test.jsonl",
+    "/workspace/opd1/data/hmmt26/test_verl.parquet",
+    data_source="hmmt26",
+    split="test",
+)
+
+normalize_jsonl(
+    "/workspace/opd1/data/amc23/test.jsonl",
+    "/workspace/opd1/data/amc23/test_verl.parquet",
+    data_source="amc23",
+    split="test",
+)
+
+normalize_jsonl(
+    "/workspace/opd1/data/math500/test.jsonl",
+    "/workspace/opd1/data/math500/test_verl.parquet",
+    data_source="math500",
+    split="test",
+)
 PY
 
-test_files="['$AIME24_PARQUET']"
+TEST_PARQUETS=(
+    "$AIME24_PARQUET"
+    "$AIME25_PARQUET"
+    "$AIME26_PARQUET"
+    "$HMMT26_PARQUET"
+    "$AMC23_PARQUET"
+    "$MATH500_PARQUET"
+)
+
+test_files="["
+for parquet in "${TEST_PARQUETS[@]}"; do
+    if [ "$test_files" != "[" ]; then
+        test_files+=","
+    fi
+    test_files+="'$parquet'"
+done
+test_files+="]"
 
 ray stop --force || true
 rm -rf /workspace/ray_tmp
