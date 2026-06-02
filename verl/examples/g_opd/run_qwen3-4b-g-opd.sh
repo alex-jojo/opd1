@@ -17,34 +17,56 @@ TRAIN_SRC="${TRAIN_SRC:-/workspace/opd1/data/train-00000-of-00001.parquet}"
 TRAIN_FILE="${TRAIN_FILE:-/workspace/opd1/verl/train_verl.parquet}"
 export TRAIN_SRC TRAIN_FILE
 
-AIME24_JSONL="/workspace/opd1/data/aime24/test.jsonl"
-AIME24_PARQUET="/workspace/opd1/data/aime24/test_verl.parquet"
+AIME26_JSONL="${AIME26_JSONL:-/workspace/G-OPD/data/aime26/test.jsonl}"
+AIME26_PARQUET="${AIME26_PARQUET:-/workspace/G-OPD/data/aime26/test_verl.parquet}"
+export AIME26_JSONL AIME26_PARQUET
 
 STUDENT_MODEL="/workspace/models/Qwen3-1.7B"
 TEACHER_MODEL="/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500"
+
+if [ ! -f "$AIME26_JSONL" ]; then
+    mkdir -p "$(dirname "$AIME26_JSONL")"
+    wget -O "$AIME26_JSONL" \
+        "https://huggingface.co/datasets/math-ai/aime26/resolve/main/aime2026.jsonl"
+fi
+
+if [ ! -f "$AIME26_JSONL" ]; then
+    echo "ERROR: AIME26 jsonl not found: $AIME26_JSONL"
+    exit 1
+fi
+
+if [ ! -f "$TRAIN_SRC" ]; then
+    mkdir -p "$(dirname "$TRAIN_SRC")"
+    wget -O "$TRAIN_SRC" \
+        "https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed/resolve/main/en/train-00000-of-00001.parquet"
+fi
 
 if [ ! -f "$TRAIN_SRC" ]; then
     echo "ERROR: training file not found: $TRAIN_SRC"
     exit 1
 fi
 
-if [ ! -f "$AIME24_JSONL" ]; then
-    echo "ERROR: AIME24 jsonl not found: $AIME24_JSONL"
-    exit 1
+download_hf_repo() {
+    local repo="$1"
+    local local_dir="$2"
+    mkdir -p /workspace/models
+    if command -v hf >/dev/null 2>&1; then
+        hf download "$repo" --local-dir "$local_dir"
+    else
+        huggingface-cli download "$repo" \
+            --local-dir "$local_dir" \
+            --local-dir-use-symlinks False
+    fi
+}
+
+if [ ! -f "$STUDENT_MODEL/config.json" ]; then
+    rm -rf "$STUDENT_MODEL"
+    download_hf_repo Qwen/Qwen3-1.7B "$STUDENT_MODEL"
 fi
 
-if [ ! -d "$STUDENT_MODEL" ]; then
-    mkdir -p /workspace/models
-    huggingface-cli download Qwen/Qwen3-1.7B \
-        --local-dir "$STUDENT_MODEL" \
-        --local-dir-use-symlinks False
-fi
-
-if [ ! -d "$TEACHER_MODEL" ]; then
-    mkdir -p /workspace/models
-    huggingface-cli download Keven16/Qwen3-4B-Non-Thinking-RL-Math-Step500 \
-        --local-dir "$TEACHER_MODEL" \
-        --local-dir-use-symlinks False
+if [ ! -f "$TEACHER_MODEL/config.json" ]; then
+    rm -rf "$TEACHER_MODEL"
+    download_hf_repo Keven16/Qwen3-4B-Non-Thinking-RL-Math-Step500 "$TEACHER_MODEL"
 fi
 
 python3 - <<PY
@@ -201,14 +223,12 @@ normalize_parquet(
 )
 
 normalize_jsonl(
-    "/workspace/opd1/data/aime24/test.jsonl",
-    "/workspace/opd1/data/aime24/test_verl.parquet",
-    data_source="aime24",
+    os.environ["AIME26_JSONL"],
+    os.environ["AIME26_PARQUET"],
+    data_source="aime26",
     split="test",
 )
 PY
-
-test_files="['$AIME24_PARQUET']"
 
 ray stop --force || true
 rm -rf /workspace/ray_tmp
@@ -244,10 +264,10 @@ python3 -m verl.trainer.main_ppo \
         algorithm.rollout_correction.bypass_mode=false \
         actor_rollout_ref.rollout.calculate_log_probs=true \
         data.train_files="$TRAIN_FILE" \
-        data.val_files="$test_files" \
+        data.val_files="$AIME26_PARQUET" \
         data.train_batch_size=128 \
         data.max_prompt_length=2048 \
-        data.max_response_length=8192 \
+        data.max_response_length=4096 \
         data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.shuffle=True \
@@ -285,7 +305,7 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.rollout.val_kwargs.do_sample=True \
         actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
         actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-        actor_rollout_ref.rollout.val_kwargs.n=32 \
+        actor_rollout_ref.rollout.val_kwargs.n=8 \
         actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
@@ -314,6 +334,6 @@ python3 -m verl.trainer.main_ppo \
         trainer.default_local_dir=/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K \
         trainer.max_actor_ckpt_to_keep=1 \
         trainer.max_critic_ckpt_to_keep=1 \
-        trainer.test_freq=10 \
+        trainer.test_freq=30 \
         trainer.total_epochs=1 \
         "$@"
