@@ -55,6 +55,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -522,6 +523,32 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            for key in (
+                "gpt_rollout_score",
+                "gpt_rollout_score_100",
+                "gpt_rollout_weighted_score_1_to_4",
+                "gpt_rollout_rubric_scores",
+                "gpt_rollout_reason",
+                "gpt_rollout_revision_suggestion",
+                "gpt_rollout_error",
+                "gpt_rollout_model",
+                "gpt_rollout_pass_score_threshold",
+                "gpt_rollout_initial_score",
+                "gpt_rollout_initial_score_100",
+                "gpt_rollout_initial_weighted_score_1_to_4",
+                "gpt_rollout_initial_rubric_scores",
+                "gpt_rollout_initial_reason",
+                "gpt_rollout_initial_revision_suggestion",
+                "gpt_rollout_initial_error",
+                "gpt_rollout_initial_model",
+                "gpt_rollout_initial_pass_score_threshold",
+                "gpt_rollout_reroll_count",
+            ):
+                if key in batch.non_tensor_batch:
+                    value = batch.non_tensor_batch[key]
+                    if hasattr(value, "tolist"):
+                        value = value.tolist()
+                    reward_extra_infos_to_dump.setdefault(key, value)
 
             self._dump_generations(
                 inputs=inputs,
@@ -531,6 +558,339 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _gpt_rollout_result_values(self, result: dict, prefix: str) -> dict:
+        return {
+            f"{prefix}_score": result["scores"],
+            f"{prefix}_score_100": result["scores_100"],
+            f"{prefix}_weighted_score_1_to_4": result["weighted_scores_1_to_4"],
+            f"{prefix}_rubric_scores": result["rubric_scores"],
+            f"{prefix}_reason": result["reasons"],
+            f"{prefix}_revision_suggestion": result["revision_suggestions"],
+            f"{prefix}_error": result["errors"],
+            f"{prefix}_model": result["models"],
+        }
+
+    def _get_gpt_rollout_pass_flags(self, scores_100: list, threshold_100: float) -> list[bool]:
+        pass_flags = []
+        for score_100 in scores_100:
+            try:
+                score_value = float(score_100)
+            except (TypeError, ValueError):
+                pass_flags.append(False)
+                continue
+            pass_flags.append(np.isfinite(score_value) and score_value > threshold_100)
+        return pass_flags
+
+    def _set_gpt_rollout_result(
+        self,
+        batch: DataProto,
+        result: dict,
+        prefix: str = "gpt_rollout",
+        threshold_100: Optional[float] = None,
+        row_idxs: Optional[list[int]] = None,
+    ) -> None:
+        row_idxs_np = None if row_idxs is None else np.array(row_idxs, dtype=np.int64)
+
+        for key, values in self._gpt_rollout_result_values(result=result, prefix=prefix).items():
+            values_array = np.array(values, dtype=object)
+            if row_idxs_np is None:
+                batch.non_tensor_batch[key] = values_array
+                continue
+
+            if key not in batch.non_tensor_batch:
+                batch.non_tensor_batch[key] = np.full(len(batch), None, dtype=object)
+            batch.non_tensor_batch[key][row_idxs_np] = values_array
+
+        if threshold_100 is not None:
+            pass_flags = self._get_gpt_rollout_pass_flags(result["scores_100"], threshold_100)
+            pass_key = f"{prefix}_pass_score_threshold"
+            pass_array = np.array(pass_flags, dtype=object)
+            if row_idxs_np is None:
+                batch.non_tensor_batch[pass_key] = pass_array
+            else:
+                if pass_key not in batch.non_tensor_batch:
+                    batch.non_tensor_batch[pass_key] = np.full(len(batch), None, dtype=object)
+                batch.non_tensor_batch[pass_key][row_idxs_np] = pass_array
+
+    def _log_gpt_rollout_score_metrics(
+        self,
+        metrics: dict,
+        scores: list,
+        scores_100: list,
+        threshold_100: float,
+        prefix: str = "gpt_rollout_score",
+    ) -> None:
+        valid_scores = []
+        for score in scores:
+            try:
+                score_value = float(score)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(score_value):
+                valid_scores.append(score_value)
+
+        metrics[f"{prefix}/valid_count"] = len(valid_scores)
+        metrics[f"{prefix}/error_count"] = len(scores) - len(valid_scores)
+        if valid_scores:
+            metrics[f"{prefix}/mean"] = float(np.mean(valid_scores))
+            metrics[f"{prefix}/min"] = float(np.min(valid_scores))
+            metrics[f"{prefix}/max"] = float(np.max(valid_scores))
+            metrics[f"{prefix}_100/mean"] = float(np.mean(valid_scores) * 100.0)
+
+        pass_flags = self._get_gpt_rollout_pass_flags(scores_100, threshold_100)
+        metrics[f"{prefix}/threshold_100"] = threshold_100
+        metrics[f"{prefix}/pass_count"] = int(sum(pass_flags))
+        metrics[f"{prefix}/low_count"] = len(pass_flags) - int(sum(pass_flags))
+
+    def _score_gpt_rollouts(self, batch: DataProto, scorer_config: dict, timing_raw: dict, timer_name: str) -> dict:
+        with marked_timer(timer_name, timing_raw, color="green"):
+            from verl.trainer.ppo.gpt_rollout_scorer import score_rollouts_with_gpt
+
+            return score_rollouts_with_gpt(batch=batch, tokenizer=self.tokenizer, config=scorer_config)
+
+    def _maybe_score_gpt_rollouts(self, batch: DataProto, metrics: dict, timing_raw: dict) -> Optional[dict]:
+        scorer_config = self.config.trainer.get("gpt_rollout_score", None)
+        if not scorer_config or not scorer_config.get("enable", False):
+            return
+
+        result = self._score_gpt_rollouts(
+            batch=batch, scorer_config=scorer_config, timing_raw=timing_raw, timer_name="gpt_rollout_score"
+        )
+        min_score_100 = float(scorer_config.get("min_score_100", 50.0))
+        self._set_gpt_rollout_result(
+            batch=batch, result=result, prefix="gpt_rollout", threshold_100=min_score_100
+        )
+        self._set_gpt_rollout_result(
+            batch=batch, result=result, prefix="gpt_rollout_initial", threshold_100=min_score_100
+        )
+        self._log_gpt_rollout_score_metrics(
+            metrics=metrics,
+            scores=result["scores"],
+            scores_100=result["scores_100"],
+            threshold_100=min_score_100,
+            prefix="gpt_rollout_score",
+        )
+        self._log_gpt_rollout_score_metrics(
+            metrics=metrics,
+            scores=result["scores"],
+            scores_100=result["scores_100"],
+            threshold_100=min_score_100,
+            prefix="gpt_rollout_initial_score",
+        )
+
+        return result
+
+    def _get_low_gpt_score_idxs(self, scores_100: list, threshold_100: float) -> list[int]:
+        low_idxs = []
+        for idx, score_100 in enumerate(scores_100):
+            try:
+                score_value = float(score_100)
+            except (TypeError, ValueError):
+                low_idxs.append(idx)
+                continue
+            if not np.isfinite(score_value) or score_value <= threshold_100:
+                low_idxs.append(idx)
+        return low_idxs
+
+    def _format_gpt_feedback_for_reroll(self, result: dict, idx: int) -> str:
+        rubric_scores = result["rubric_scores"][idx]
+        revision_suggestion = result["revision_suggestions"][idx]
+
+        feedback = {}
+        if isinstance(rubric_scores, dict):
+            sanitized_rubric = {}
+            for name, score_info in rubric_scores.items():
+                if isinstance(score_info, dict):
+                    sanitized_rubric[name] = {
+                        key: value for key, value in score_info.items() if key != "weight"
+                    }
+                else:
+                    sanitized_rubric[name] = score_info
+            feedback["rubric_scores"] = sanitized_rubric
+
+        if revision_suggestion:
+            feedback["revision_suggestion"] = revision_suggestion
+
+        if not feedback:
+            return ""
+
+        feedback_json = json.dumps(feedback, ensure_ascii=False)
+        return (
+            "\n\n[GPT Feedback on Previous Solution]\n"
+            f"{feedback_json}\n\n"
+            "Please solve the problem again using the feedback above."
+        )
+
+    def _append_gpt_feedback_to_reroll_prompts(
+        self,
+        gen_batch: DataProto,
+        row_idxs: list[int],
+        initial_score_result: dict,
+        scorer_config: dict,
+    ) -> int:
+        if not row_idxs:
+            return 0
+
+        input_ids = gen_batch.batch["input_ids"]
+        attention_mask = gen_batch.batch["attention_mask"]
+        position_ids = gen_batch.batch["position_ids"]
+        prompt_length = input_ids.shape[-1]
+        max_feedback_tokens = max(0, int(scorer_config.get("max_reroll_feedback_tokens", 512)))
+        if max_feedback_tokens == 0:
+            return 0
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        appended_count = 0
+        for idx in row_idxs:
+            feedback_text = self._format_gpt_feedback_for_reroll(initial_score_result, idx)
+            if not feedback_text:
+                continue
+
+            feedback_ids = self.tokenizer.encode(feedback_text, add_special_tokens=False)
+            feedback_ids = feedback_ids[:max_feedback_tokens]
+            if not feedback_ids:
+                continue
+
+            valid_prompt_len = int(attention_mask[idx].sum().item())
+            if valid_prompt_len > 0:
+                valid_prompt_ids = input_ids[idx, -valid_prompt_len:].detach().cpu().tolist()
+            else:
+                valid_prompt_ids = []
+            combined_ids = valid_prompt_ids + feedback_ids
+            if len(combined_ids) > prompt_length:
+                combined_ids = combined_ids[-prompt_length:]
+
+            new_input_ids = torch.full_like(input_ids[idx], int(pad_token_id))
+            new_attention_mask = torch.zeros_like(attention_mask[idx])
+            new_ids = torch.tensor(combined_ids, dtype=input_ids.dtype, device=input_ids.device)
+            new_input_ids[-len(combined_ids) :] = new_ids
+            new_attention_mask[-len(combined_ids) :] = 1
+
+            input_ids[idx] = new_input_ids
+            attention_mask[idx] = new_attention_mask
+
+            new_position_ids = compute_position_id_with_mask(new_attention_mask.unsqueeze(0)).squeeze(0)
+            if position_ids.dim() == 2:
+                position_ids[idx] = new_position_ids.to(device=position_ids.device, dtype=position_ids.dtype)
+            elif position_ids.dim() == 3:
+                position_ids[idx] = (
+                    new_position_ids.to(device=position_ids.device, dtype=position_ids.dtype)
+                    .unsqueeze(0)
+                    .expand_as(position_ids[idx])
+                )
+
+            appended_count += 1
+
+        return appended_count
+
+    def _replace_rollout_rows(self, batch: DataProto, rollout_output: DataProto, row_idxs: list[int]) -> None:
+        if not row_idxs:
+            return
+
+        row_idxs_np = np.array(row_idxs, dtype=np.int64)
+
+        for key, value in rollout_output.batch.items():
+            if key in batch.batch:
+                row_idxs_torch = torch.tensor(row_idxs, device=batch.batch[key].device, dtype=torch.long)
+                batch.batch[key][row_idxs_torch] = value.to(batch.batch[key].device)
+
+        for key, value in rollout_output.non_tensor_batch.items():
+            if key in batch.non_tensor_batch:
+                batch.non_tensor_batch[key][row_idxs_np] = value
+
+    def _set_standard_opd_teacher_inputs(self, batch: DataProto) -> None:
+        batch.batch["ref_input_ids"] = batch.batch["input_ids"].clone()
+        batch.batch["ref_attention_mask"] = batch.batch["attention_mask"].clone()
+        batch.batch["ref_position_ids"] = batch.batch["position_ids"].clone()
+
+    def _maybe_reroll_low_gpt_rollouts(
+        self,
+        batch: DataProto,
+        gen_batch: DataProto,
+        initial_score_result: dict | None,
+        metrics: dict,
+        timing_raw: dict,
+    ) -> None:
+        scorer_config = self.config.trainer.get("gpt_rollout_score", None)
+        if not scorer_config or not scorer_config.get("enable", False) or initial_score_result is None:
+            return
+
+        threshold_100 = float(scorer_config.get("min_score_100", 50.0))
+        max_attempts = int(scorer_config.get("max_rerollout_attempts", 1))
+        reroll_counts = np.zeros(len(batch), dtype=object)
+        low_idxs = self._get_low_gpt_score_idxs(initial_score_result["scores_100"], threshold_100)
+        metrics["gpt_rollout_reroll/initial_low_count"] = len(low_idxs)
+        metrics["gpt_rollout_reroll/threshold_100"] = threshold_100
+        metrics["gpt_rollout_reroll/max_attempts"] = max_attempts
+
+        gen_batch_for_reroll = None
+        for attempt in range(max_attempts):
+            if not low_idxs:
+                break
+
+            if gen_batch_for_reroll is None:
+                gen_batch_for_reroll = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+                feedback_count = self._append_gpt_feedback_to_reroll_prompts(
+                    gen_batch=gen_batch_for_reroll,
+                    row_idxs=low_idxs,
+                    initial_score_result=initial_score_result,
+                    scorer_config=scorer_config,
+                )
+                metrics["gpt_rollout_reroll/feedback_prompt_count"] = feedback_count
+            reroll_gen_batch = gen_batch_for_reroll.select_idxs(low_idxs)
+            with marked_timer(f"gpt_reroll_gen_{attempt + 1}", timing_raw, color="red"):
+                if not self.async_rollout_mode:
+                    reroll_output = self.actor_rollout_wg.generate_sequences(reroll_gen_batch)
+                else:
+                    reroll_output = self.async_rollout_manager.generate_sequences(reroll_gen_batch)
+
+                for key, value in reroll_output.meta_info.get("timing", {}).items():
+                    timing_raw[f"gpt_reroll_{attempt + 1}/{key}"] = value
+                reroll_output.meta_info.pop("timing", None)
+
+            self._replace_rollout_rows(batch=batch, rollout_output=reroll_output, row_idxs=low_idxs)
+            for idx in low_idxs:
+                reroll_counts[idx] = int(reroll_counts[idx]) + 1
+
+            batch.batch["response_mask"] = compute_response_mask(batch)
+            rerolled_batch = batch.select_idxs(low_idxs)
+            score_result = self._score_gpt_rollouts(
+                batch=rerolled_batch,
+                scorer_config=scorer_config,
+                timing_raw=timing_raw,
+                timer_name=f"gpt_reroll_score_{attempt + 1}",
+            )
+            self._set_gpt_rollout_result(
+                batch=batch,
+                result=score_result,
+                prefix="gpt_rollout",
+                threshold_100=threshold_100,
+                row_idxs=low_idxs,
+            )
+
+            next_low_local_idxs = self._get_low_gpt_score_idxs(score_result["scores_100"], threshold_100)
+            low_idxs = [low_idxs[idx] for idx in next_low_local_idxs]
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_low_count"] = len(low_idxs)
+
+        batch.non_tensor_batch["gpt_rollout_reroll_count"] = reroll_counts
+        final_scores = batch.non_tensor_batch["gpt_rollout_score"].tolist()
+        final_scores_100 = batch.non_tensor_batch["gpt_rollout_score_100"].tolist()
+        final_low_idxs = self._get_low_gpt_score_idxs(final_scores_100, threshold_100)
+        self._log_gpt_rollout_score_metrics(
+            metrics=metrics,
+            scores=final_scores,
+            scores_100=final_scores_100,
+            threshold_100=threshold_100,
+            prefix="gpt_rollout_score",
+        )
+        metrics["gpt_rollout_reroll/final_low_count"] = len(final_low_idxs)
+        metrics["gpt_rollout_reroll/rerolled_count"] = int(sum(int(count) > 0 for count in reroll_counts))
+        metrics["gpt_rollout_reroll/total_rerolls"] = int(sum(int(count) for count in reroll_counts))
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1125,6 +1485,16 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    gpt_score_result = self._maybe_score_gpt_rollouts(batch=batch, metrics=metrics, timing_raw=timing_raw)
+                    self._maybe_reroll_low_gpt_rollouts(
+                        batch=batch,
+                        gen_batch=gen_batch,
+                        initial_score_result=gpt_score_result,
+                        metrics=metrics,
+                        timing_raw=timing_raw,
+                    )
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1182,6 +1552,7 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    self._set_standard_opd_teacher_inputs(batch)
 
                     if self.use_reference_policy:
                         # compute reference log_prob

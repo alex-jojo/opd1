@@ -146,6 +146,21 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Optional GPT scoring for training rollouts. This is logging-only and does not affect rewards or advantages.
+  gpt_rollout_score:
+    enable: False
+    model: gpt-4.1-mini
+    base_url: null
+    max_workers: 8
+    timeout: 60
+    retries: 2
+    max_prompt_chars: 8000
+    max_response_chars: 16000
+    max_output_tokens: 1024
+    min_score_100: 50
+    max_rerollout_attempts: 1
+    max_reroll_feedback_tokens: 512
+
   # Number of nodes used in the training
   nnodes: 1
 

@@ -13,8 +13,9 @@ export HYDRA_FULL_ERROR=1
 
 cd /workspace/opd1/verl
 
-TRAIN_SRC="/workspace/opd1/verl/train-00000-of-00001.parquet"
-TRAIN_FILE="/workspace/opd1/verl/train_verl.parquet"
+TRAIN_SRC="${TRAIN_SRC:-/workspace/opd1/data/train-00000-of-00001.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-/workspace/opd1/verl/train_verl.parquet}"
+export TRAIN_SRC TRAIN_FILE
 
 AIME24_JSONL="/workspace/opd1/data/aime24/test.jsonl"
 AIME24_PARQUET="/workspace/opd1/data/aime24/test_verl.parquet"
@@ -58,6 +59,7 @@ PY
 
 python3 - <<'PY'
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -74,6 +76,10 @@ def pick_text(x):
 
 
 def pick_answer(x):
+    reward_model = x.get("reward_model")
+    if isinstance(reward_model, dict) and reward_model.get("ground_truth") is not None:
+        return reward_model.get("ground_truth")
+
     return (
         x.get("answer")
         or x.get("final_answer")
@@ -123,6 +129,7 @@ def normalize_parquet(src, dst, data_source, split):
             "split": split,
             "index": int(i),
             "answer": "" if answer is None else str(answer),
+            "problem": problem if isinstance(problem, str) else json.dumps(problem, ensure_ascii=False),
         })
 
         rows.append({
@@ -172,6 +179,7 @@ def normalize_jsonl(src, dst, data_source, split):
                     "split": split,
                     "index": i,
                     "answer": "" if answer is None else str(answer),
+                    "problem": problem if isinstance(problem, str) else json.dumps(problem, ensure_ascii=False),
                 },
             })
 
@@ -186,8 +194,8 @@ def normalize_jsonl(src, dst, data_source, split):
 
 
 normalize_parquet(
-    "/workspace/opd1/verl/train-00000-of-00001.parquet",
-    "/workspace/opd1/verl/train_verl.parquet",
+    os.environ["TRAIN_SRC"],
+    os.environ["TRAIN_FILE"],
     data_source="dapo_math_17k",
     split="train",
 )
@@ -205,6 +213,28 @@ test_files="['$AIME24_PARQUET']"
 ray stop --force || true
 rm -rf /workspace/ray_tmp
 mkdir -p /workspace/ray_tmp
+
+GPT_ROLLOUT_SCORE_ENABLE="${GPT_ROLLOUT_SCORE_ENABLE:-True}"
+GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-gpt-4.1-mini}"
+GPT_ROLLOUT_SCORE_MAX_WORKERS="${GPT_ROLLOUT_SCORE_MAX_WORKERS:-8}"
+GPT_ROLLOUT_SCORE_TIMEOUT="${GPT_ROLLOUT_SCORE_TIMEOUT:-60}"
+GPT_ROLLOUT_SCORE_RETRIES="${GPT_ROLLOUT_SCORE_RETRIES:-2}"
+GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS="${GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS:-8000}"
+GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS="${GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS:-16000}"
+GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS:-1024}"
+GPT_ROLLOUT_SCORE_MIN_SCORE_100="${GPT_ROLLOUT_SCORE_MIN_SCORE_100:-50}"
+GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS="${GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS:-1}"
+GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS:-512}"
+GPT_ROLLOUT_DATA_DIR="${GPT_ROLLOUT_DATA_DIR:-/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K/rollout_data}"
+
+case "$GPT_ROLLOUT_SCORE_ENABLE" in
+    True|true|1|yes|YES)
+        if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: OPENAI_API_KEY is required when GPT rollout scoring is enabled"
+            exit 1
+        fi
+        ;;
+esac
 
 python3 -m verl.trainer.main_ppo \
         algorithm.adv_estimator=grpo \
@@ -231,6 +261,8 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True \
+        actor_rollout_ref.actor.policy_loss.lambda_vals=1.0 \
+        actor_rollout_ref.actor.policy_loss.multi_teacher_distill=False \
         actor_rollout_ref.actor.ppo_mini_batch_size=128 \
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.actor.use_kl_loss=True \
@@ -258,6 +290,18 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
         reward_model.reward_manager=naive \
+        trainer.gpt_rollout_score.enable="$GPT_ROLLOUT_SCORE_ENABLE" \
+        trainer.gpt_rollout_score.model="$GPT_ROLLOUT_SCORE_MODEL" \
+        trainer.gpt_rollout_score.max_workers="$GPT_ROLLOUT_SCORE_MAX_WORKERS" \
+        trainer.gpt_rollout_score.timeout="$GPT_ROLLOUT_SCORE_TIMEOUT" \
+        trainer.gpt_rollout_score.retries="$GPT_ROLLOUT_SCORE_RETRIES" \
+        trainer.gpt_rollout_score.max_prompt_chars="$GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS" \
+        trainer.gpt_rollout_score.max_response_chars="$GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS" \
+        trainer.gpt_rollout_score.max_output_tokens="$GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS" \
+        trainer.gpt_rollout_score.min_score_100="$GPT_ROLLOUT_SCORE_MIN_SCORE_100" \
+        trainer.gpt_rollout_score.max_rerollout_attempts="$GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS" \
+        trainer.gpt_rollout_score.max_reroll_feedback_tokens="$GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS" \
+        trainer.rollout_data_dir="$GPT_ROLLOUT_DATA_DIR" \
         trainer.critic_warmup=0 \
         trainer.val_before_train=True \
         trainer.logger='["console","wandb"]' \
