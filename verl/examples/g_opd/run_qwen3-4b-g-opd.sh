@@ -256,9 +256,21 @@ ray stop --force || true
 rm -rf /workspace/ray_tmp
 mkdir -p /workspace/ray_tmp
 
+G_OPD_CKPT_DIR="${G_OPD_CKPT_DIR:-/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K}"
+G_OPD_RESUME_MODE="${G_OPD_RESUME_MODE:-disable}"
+G_OPD_RESUME_FROM_PATH="${G_OPD_RESUME_FROM_PATH:-null}"
+
+case "$G_OPD_RESUME_MODE" in
+    auto|disable|resume_path) ;;
+    *)
+        echo "ERROR: G_OPD_RESUME_MODE must be one of: auto, disable, resume_path"
+        exit 1
+        ;;
+esac
+
 GPT_ROLLOUT_SCORE_ENABLE="${GPT_ROLLOUT_SCORE_ENABLE:-True}"
 GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-gpt-5.5-2026-04-23}"
-GPT_ROLLOUT_SCORE_MAX_WORKERS="${GPT_ROLLOUT_SCORE_MAX_WORKERS:-16}"
+GPT_ROLLOUT_SCORE_MAX_WORKERS="${GPT_ROLLOUT_SCORE_MAX_WORKERS:-32}"
 GPT_ROLLOUT_SCORE_TIMEOUT="${GPT_ROLLOUT_SCORE_TIMEOUT:-60}"
 GPT_ROLLOUT_SCORE_RETRIES="${GPT_ROLLOUT_SCORE_RETRIES:-2}"
 GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS="${GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS:-8000}"
@@ -268,7 +280,7 @@ GPT_ROLLOUT_SCORE_MIN_SCORE_100="${GPT_ROLLOUT_SCORE_MIN_SCORE_100:-50}"
 GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS="${GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS:-1}"
 GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS:-512}"
 GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-0}"
-GPT_ROLLOUT_DATA_DIR="${GPT_ROLLOUT_DATA_DIR:-/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K/rollout_data}"
+GPT_ROLLOUT_DATA_DIR="${GPT_ROLLOUT_DATA_DIR:-$G_OPD_CKPT_DIR/rollout_data}"
 
 case "$GPT_ROLLOUT_SCORE_ENABLE" in
     True|true|1|yes|YES)
@@ -354,7 +366,9 @@ python3 -m verl.trainer.main_ppo \
         trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
         trainer.save_freq=50 \
-        trainer.default_local_dir=/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K \
+        trainer.resume_mode="$G_OPD_RESUME_MODE" \
+        trainer.resume_from_path="$G_OPD_RESUME_FROM_PATH" \
+        trainer.default_local_dir="$G_OPD_CKPT_DIR" \
         trainer.max_actor_ckpt_to_keep=1 \
         trainer.max_critic_ckpt_to_keep=1 \
         trainer.test_freq=30 \
