@@ -160,6 +160,7 @@ trainer:
     min_score_100: 50
     max_rerollout_attempts: 1
     max_reroll_feedback_tokens: 512
+    verbose: False
 
   # Number of nodes used in the training
   nnodes: 1

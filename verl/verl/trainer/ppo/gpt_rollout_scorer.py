@@ -1,9 +1,10 @@
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 
@@ -14,6 +15,10 @@ RUBRIC_NAMES = (
     "Expression Conciseness",
     "Solution Reasonableness",
 )
+
+TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+FALSE_VALUES = {"0", "false", "f", "no", "n", "off", ""}
+_LOG_LOCK = threading.Lock()
 
 EVALUATION_PROMPT_TEMPLATE = """You are a mathematical solution quality evaluation model. Your task is to score a given solution based on the provided [Problem], [Ground Truth Answer], and [Solution to Evaluate].
 Please note: the [Ground Truth Answer] contains only the final correct answer and does not include a reference solution or intermediate reasoning. Therefore, you should not require the evaluated solution to match any specific solution method. Instead, you should independently judge whether the mathematical reasoning is valid, whether the final answer is correct, and whether the explanation is clear and reasonable.
@@ -112,6 +117,32 @@ def _get(config: Any, key: str, default: Any = None) -> Any:
     if hasattr(config, "get"):
         return config.get(key, default)
     return getattr(config, key, default)
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUE_VALUES:
+            return True
+        if normalized in FALSE_VALUES:
+            return False
+    return bool(value)
+
+
+def _debug_print(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with _LOG_LOCK:
+        print(f"[gpt_rollout_score] {timestamp} {message}", flush=True)
+
+
+def _format_error(error: str, max_chars: int = 240) -> str:
+    return str(error).replace("\n", " ")[:max_chars]
 
 
 def _to_list(value: Any, length: int, default: Any) -> list[Any]:
@@ -228,6 +259,9 @@ def _score_one(
     timeout: float,
     retries: int,
     max_output_tokens: int,
+    request_idx: int,
+    request_count: int,
+    verbose: bool,
 ) -> dict[str, Any]:
     user_prompt = EVALUATION_PROMPT_TEMPLATE.format(
         problem=problem,
@@ -258,12 +292,25 @@ def _score_one(
     }
 
     last_error = ""
-    for attempt in range(retries + 1):
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        attempt_start = time.time()
+        if verbose:
+            _debug_print(
+                f"request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} start "
+                f"model={model} prompt_chars={len(problem)} response_chars={len(response)} "
+                f"ground_truth_chars={len(ground_truth)} timeout={timeout:g}s max_output_tokens={max_output_tokens}"
+            )
         try:
             api_response = _post_json(api_url, api_key, payload, timeout)
             text = _extract_response_text(api_response)
             parsed = json.loads(text)
             score_100 = max(0.0, min(100.0, float(parsed["final_score_100"])))
+            if verbose:
+                _debug_print(
+                    f"request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} done "
+                    f"score_100={score_100:.1f} elapsed={time.time() - attempt_start:.1f}s"
+                )
             return {
                 "score": score_100 / 100.0,
                 "score_100": score_100,
@@ -279,8 +326,17 @@ def _score_one(
         except Exception as exc:
             last_error = str(exc)
 
+        if verbose:
+            status = "retry" if attempt < retries else "failed"
+            _debug_print(
+                f"request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} {status} "
+                f"elapsed={time.time() - attempt_start:.1f}s error={_format_error(last_error)}"
+            )
         if attempt < retries:
-            time.sleep(min(2**attempt, 8))
+            sleep_seconds = min(2**attempt, 8)
+            if verbose:
+                _debug_print(f"request {request_idx}/{request_count} sleep_before_retry={sleep_seconds}s")
+            time.sleep(sleep_seconds)
 
     return {
         "score": None,
@@ -307,12 +363,20 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
     max_prompt_chars = int(_get(config, "max_prompt_chars", 8000))
     max_response_chars = int(_get(config, "max_response_chars", 16000))
     max_output_tokens = int(_get(config, "max_output_tokens", 1024))
+    verbose = _to_bool(_get(config, "verbose", os.environ.get("GPT_ROLLOUT_SCORE_VERBOSE", "0")))
 
     prompt_ids = batch.batch["prompts"]
     response_ids = batch.batch["responses"]
     attention_mask = batch.batch["attention_mask"]
     prompt_len = prompt_ids.shape[-1]
     batch_size = len(batch)
+
+    worker_count = min(max_workers, max(1, batch_size))
+    if verbose:
+        _debug_print(
+            f"batch start requests={batch_size} max_workers={worker_count} model={model} "
+            f"timeout={timeout:g}s retries={retries} max_output_tokens={max_output_tokens} api_url={api_url}"
+        )
 
     extra_infos = _to_list(batch.non_tensor_batch.get("extra_info"), batch_size, {})
     reward_models = _to_list(batch.non_tensor_batch.get("reward_model"), batch_size, {})
@@ -344,11 +408,63 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
                 "timeout": timeout,
                 "retries": retries,
                 "max_output_tokens": max_output_tokens,
+                "request_idx": i + 1,
+                "request_count": batch_size,
+                "verbose": verbose,
             }
         )
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, batch_size))) as executor:
-        results = list(executor.map(lambda kwargs: _score_one(**kwargs), requests))
+    results: list[dict[str, Any] | None] = [None] * len(requests)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_idx = {executor.submit(_score_one, **request): idx for idx, request in enumerate(requests)}
+        for done_count, future in enumerate(as_completed(future_to_idx), start=1):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "score": None,
+                    "score_100": None,
+                    "weighted_score_1_to_4": None,
+                    "rubric_scores": None,
+                    "reason": "",
+                    "revision_suggestion": "",
+                    "error": str(exc),
+                }
+            results[idx] = result
+            if verbose:
+                score = result["score_100"]
+                score_text = "error" if score is None else f"{float(score):.1f}"
+                error_text = result["error"]
+                if error_text:
+                    _debug_print(
+                        f"batch progress done={done_count}/{batch_size} request_idx={idx + 1} "
+                        f"score_100={score_text} error={_format_error(error_text)}"
+                    )
+                else:
+                    _debug_print(
+                        f"batch progress done={done_count}/{batch_size} request_idx={idx + 1} "
+                        f"score_100={score_text}"
+                    )
+
+    results = [
+        result
+        if result is not None
+        else {
+            "score": None,
+            "score_100": None,
+            "weighted_score_1_to_4": None,
+            "rubric_scores": None,
+            "reason": "",
+            "revision_suggestion": "",
+            "error": "missing GPT rollout scoring result",
+        }
+        for result in results
+    ]
+
+    if verbose:
+        valid_count = sum(result["score"] is not None for result in results)
+        _debug_print(f"batch result_summary valid_count={valid_count} error_count={batch_size - valid_count}")
 
     return {
         "scores": [result["score"] for result in results],

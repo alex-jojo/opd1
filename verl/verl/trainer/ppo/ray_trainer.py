@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -60,6 +61,20 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+
+
+def _is_truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "none", "null"}
+    return bool(value)
+
+
+def _g_opd_truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 @dataclass
@@ -651,9 +666,13 @@ class RayPPOTrainer:
 
     def _maybe_score_gpt_rollouts(self, batch: DataProto, metrics: dict, timing_raw: dict) -> Optional[dict]:
         scorer_config = self.config.trainer.get("gpt_rollout_score", None)
-        if not scorer_config or not scorer_config.get("enable", False):
+        if not scorer_config or not _is_truthy(scorer_config.get("enable", False)):
             return
 
+        self._debug_progress(
+            f"gpt_rollout_score:start batch_size={len(batch)} "
+            f"model={scorer_config.get('model', '?')} max_workers={scorer_config.get('max_workers', '?')}"
+        )
         result = self._score_gpt_rollouts(
             batch=batch, scorer_config=scorer_config, timing_raw=timing_raw, timer_name="gpt_rollout_score"
         )
@@ -677,6 +696,11 @@ class RayPPOTrainer:
             scores_100=result["scores_100"],
             threshold_100=min_score_100,
             prefix="gpt_rollout_initial_score",
+        )
+        valid_count = sum(score is not None for score in result["scores_100"])
+        error_count = len(result["scores_100"]) - valid_count
+        self._debug_progress(
+            f"gpt_rollout_score:done valid_count={valid_count} error_count={error_count} threshold_100={min_score_100}"
         )
 
         return result
@@ -771,6 +795,8 @@ class RayPPOTrainer:
 
             input_ids[idx] = new_input_ids
             attention_mask[idx] = new_attention_mask
+            if "raw_prompt_ids" in gen_batch.non_tensor_batch:
+                gen_batch.non_tensor_batch["raw_prompt_ids"][idx] = list(combined_ids)
 
             new_position_ids = compute_position_id_with_mask(new_attention_mask.unsqueeze(0)).squeeze(0)
             if position_ids.dim() == 2:
@@ -785,6 +811,32 @@ class RayPPOTrainer:
             appended_count += 1
 
         return appended_count
+
+    def _mark_gpt_rollout_result_unscored_after_reroll(self, batch: DataProto, row_idxs: list[int]) -> None:
+        if not row_idxs:
+            return
+
+        row_idxs_np = np.array(row_idxs, dtype=np.int64)
+        null_fields = (
+            "gpt_rollout_score",
+            "gpt_rollout_score_100",
+            "gpt_rollout_weighted_score_1_to_4",
+            "gpt_rollout_rubric_scores",
+            "gpt_rollout_model",
+            "gpt_rollout_pass_score_threshold",
+        )
+        empty_string_fields = (
+            "gpt_rollout_reason",
+            "gpt_rollout_revision_suggestion",
+        )
+        for key in null_fields:
+            if key in batch.non_tensor_batch:
+                batch.non_tensor_batch[key][row_idxs_np] = None
+        for key in empty_string_fields:
+            if key in batch.non_tensor_batch:
+                batch.non_tensor_batch[key][row_idxs_np] = ""
+        if "gpt_rollout_error" in batch.non_tensor_batch:
+            batch.non_tensor_batch["gpt_rollout_error"][row_idxs_np] = "skipped GPT rescore after reroll"
 
     def _replace_rollout_rows(self, batch: DataProto, rollout_output: DataProto, row_idxs: list[int]) -> None:
         if not row_idxs:
@@ -815,16 +867,21 @@ class RayPPOTrainer:
         timing_raw: dict,
     ) -> None:
         scorer_config = self.config.trainer.get("gpt_rollout_score", None)
-        if not scorer_config or not scorer_config.get("enable", False) or initial_score_result is None:
+        if not scorer_config or not _is_truthy(scorer_config.get("enable", False)) or initial_score_result is None:
             return
 
         threshold_100 = float(scorer_config.get("min_score_100", 50.0))
-        max_attempts = int(scorer_config.get("max_rerollout_attempts", 1))
+        configured_max_attempts = int(scorer_config.get("max_rerollout_attempts", 1))
+        max_attempts = min(max(configured_max_attempts, 0), 1)
         reroll_counts = np.zeros(len(batch), dtype=object)
         low_idxs = self._get_low_gpt_score_idxs(initial_score_result["scores_100"], threshold_100)
         metrics["gpt_rollout_reroll/initial_low_count"] = len(low_idxs)
         metrics["gpt_rollout_reroll/threshold_100"] = threshold_100
         metrics["gpt_rollout_reroll/max_attempts"] = max_attempts
+        self._debug_progress(
+            f"gpt_reroll:start low_count={len(low_idxs)} threshold_100={threshold_100} max_attempts={max_attempts}"
+        )
+        metrics["gpt_rollout_reroll/configured_max_attempts"] = configured_max_attempts
 
         gen_batch_for_reroll = None
         for attempt in range(max_attempts):
@@ -843,6 +900,7 @@ class RayPPOTrainer:
                 )
                 metrics["gpt_rollout_reroll/feedback_prompt_count"] = feedback_count
             reroll_gen_batch = gen_batch_for_reroll.select_idxs(low_idxs)
+            self._debug_progress(f"gpt_reroll_generate:start attempt={attempt + 1}/{max_attempts} count={len(low_idxs)}")
             with marked_timer(f"gpt_reroll_gen_{attempt + 1}", timing_raw, color="red"):
                 if not self.async_rollout_mode:
                     reroll_output = self.actor_rollout_wg.generate_sequences(reroll_gen_batch)
@@ -853,29 +911,16 @@ class RayPPOTrainer:
                     timing_raw[f"gpt_reroll_{attempt + 1}/{key}"] = value
                 reroll_output.meta_info.pop("timing", None)
 
+            rerolled_idxs = list(low_idxs)
             self._replace_rollout_rows(batch=batch, rollout_output=reroll_output, row_idxs=low_idxs)
             for idx in low_idxs:
                 reroll_counts[idx] = int(reroll_counts[idx]) + 1
 
             batch.batch["response_mask"] = compute_response_mask(batch)
-            rerolled_batch = batch.select_idxs(low_idxs)
-            score_result = self._score_gpt_rollouts(
-                batch=rerolled_batch,
-                scorer_config=scorer_config,
-                timing_raw=timing_raw,
-                timer_name=f"gpt_reroll_score_{attempt + 1}",
-            )
-            self._set_gpt_rollout_result(
-                batch=batch,
-                result=score_result,
-                prefix="gpt_rollout",
-                threshold_100=threshold_100,
-                row_idxs=low_idxs,
-            )
-
-            next_low_local_idxs = self._get_low_gpt_score_idxs(score_result["scores_100"], threshold_100)
-            low_idxs = [low_idxs[idx] for idx in next_low_local_idxs]
-            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_low_count"] = len(low_idxs)
+            self._mark_gpt_rollout_result_unscored_after_reroll(batch=batch, row_idxs=rerolled_idxs)
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rerolled_count"] = len(rerolled_idxs)
+            self._debug_progress(f"gpt_reroll_generate:done attempt={attempt + 1}/{max_attempts} count={len(rerolled_idxs)}")
+            low_idxs = []
 
         batch.non_tensor_batch["gpt_rollout_reroll_count"] = reroll_counts
         final_scores = batch.non_tensor_batch["gpt_rollout_score"].tolist()
@@ -891,6 +936,10 @@ class RayPPOTrainer:
         metrics["gpt_rollout_reroll/final_low_count"] = len(final_low_idxs)
         metrics["gpt_rollout_reroll/rerolled_count"] = int(sum(int(count) > 0 for count in reroll_counts))
         metrics["gpt_rollout_reroll/total_rerolls"] = int(sum(int(count) for count in reroll_counts))
+        metrics["gpt_rollout_reroll/rescore_skipped_count"] = metrics["gpt_rollout_reroll/total_rerolls"]
+        self._debug_progress(
+            f"gpt_reroll:done final_low_count={len(final_low_idxs)} total_rerolls={metrics['gpt_rollout_reroll/total_rerolls']} rescore_skipped_count={metrics['gpt_rollout_reroll/rescore_skipped_count']}"
+        )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -932,6 +981,19 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _progress_debug_enabled(self) -> bool:
+        trainer_value = self.config.trainer.get("progress_debug", None)
+        if trainer_value is None:
+            trainer_value = os.environ.get("G_OPD_PROGRESS_DEBUG", "0")
+        return _g_opd_truthy(trainer_value)
+
+    def _debug_progress(self, message: str) -> None:
+        if not self._progress_debug_enabled():
+            return
+        total_steps = getattr(self, "total_training_steps", "?")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[g_opd_progress] {timestamp} step={self.global_steps}/{total_steps} {message}", flush=True)
 
     def _validate(self):
         data_source_lst = []
@@ -1425,6 +1487,10 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                self._debug_progress(
+                    f"step:start epoch={epoch} train_batch_size={len(batch)} "
+                    f"rollout_n={self.config.actor_rollout_ref.rollout.n}"
+                )
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
@@ -1442,6 +1508,10 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    self._debug_progress(
+                        f"rollout_generate:start prompt_batch_size={len(gen_batch)} "
+                        f"repeated_batch_size={len(gen_batch_output)} async={self.async_rollout_mode}"
+                    )
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
@@ -1450,6 +1520,8 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+
+                    self._debug_progress(f"rollout_generate:done output_batch_size={len(gen_batch_output)}")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1485,6 +1557,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._debug_progress(f"batch_prepare:done rollout_batch_size={len(batch)}")
 
                     gpt_score_result = self._maybe_score_gpt_rollouts(batch=batch, metrics=metrics, timing_raw=timing_raw)
                     self._maybe_reroll_low_gpt_rollouts(
@@ -1505,6 +1578,9 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    self._debug_progress(
+                        f"reward:start use_rm={self.use_rm} launch_async={self.config.reward_model.launch_reward_fn_async}"
+                    )
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1517,6 +1593,7 @@ class RayPPOTrainer:
                             )
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    self._debug_progress("reward:done")
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1525,6 +1602,8 @@ class RayPPOTrainer:
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        self._debug_progress("old_log_prob:skip bypass_mode=true")
+                        self._debug_progress("rollout_correction:start mode=bypass")
                         from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
 
                         apply_rollout_correction(
@@ -1532,7 +1611,9 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                        self._debug_progress("rollout_correction:done mode=bypass")
                     else:  # Recompute old_log_probs
+                        self._debug_progress("old_log_prob:start")
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
@@ -1550,12 +1631,14 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                        self._debug_progress("old_log_prob:done")
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
                     self._set_standard_opd_teacher_inputs(batch)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
+                        self._debug_progress("ref_log_prob:start")
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             # Get apply_chat_template_kwargs from config if available
                             apply_chat_template_kwargs = self.config.data.get(
@@ -1624,10 +1707,14 @@ class RayPPOTrainer:
                                     ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_log_prob)
 
+                    if self.use_reference_policy:
+                        self._debug_progress("ref_log_prob:done")
+
                     # Compute base model log probs for corrected reward computation
                     # This computes: base_log_prob from actor's base model (using input_ids)
                     # and base_ref_log_prob from ref's base model (using ref_input_ids)
                     if self.use_base_models:
+                        self._debug_progress("base_log_probs:start")
                         with marked_timer("base_log_probs", timing_raw, color="green"):
                             # First compute base_ref_log_prob using ref's base model
                             # This uses ref_input_ids which may be present in batch
@@ -1659,12 +1746,18 @@ class RayPPOTrainer:
                                   f"base_log_prob shape={batch.batch['base_log_prob'].shape}, "
                                   f"base_ref_log_prob shape={batch.batch['base_ref_log_prob'].shape}") 
                     
+                    if self.use_base_models:
+                        self._debug_progress("base_log_probs:done")
+
                     # compute values
                     if self.use_critic:
+                        self._debug_progress("values:start")
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                        self._debug_progress("values:done")
 
+                    self._debug_progress("advantage:start")
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1713,27 +1806,38 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                    self._debug_progress("advantage:done")
 
                     # update critic
                     if self.use_critic:
+                        self._debug_progress("update_critic:start")
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+                        self._debug_progress("update_critic:done")
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        self._debug_progress("update_actor:start")
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        self._debug_progress("update_actor:done")
+                    else:
+                        self._debug_progress(
+                            f"update_actor:skip critic_warmup={self.config.trainer.critic_warmup}"
+                        )
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
+                        self._debug_progress(f"rollout_data_log:start dir={rollout_data_dir}")
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        self._debug_progress("rollout_data_log:done")
 
                 # validate
                 if (
@@ -1741,11 +1845,13 @@ class RayPPOTrainer:
                     and self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
+                    self._debug_progress("validation:start")
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    self._debug_progress("validation:done")
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
@@ -1804,7 +1910,9 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
+                self._debug_progress("metrics_log:start")
                 logger.log(data=metrics, step=self.global_steps)
+                self._debug_progress("metrics_log:done")
 
                 progress_bar.update(1)
                 self.global_steps += 1

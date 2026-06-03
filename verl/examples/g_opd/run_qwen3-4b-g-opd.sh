@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-set -x
 set -euo pipefail
+
+if [ "${G_OPD_SHELL_DEBUG:-0}" = "1" ]; then
+    set -x
+fi
 
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -10,8 +13,27 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 export RAY_DISABLE_DOCKER_CPU_WARNING=1
 export HYDRA_FULL_ERROR=1
+export VERL_PRINT_CONFIG="${VERL_PRINT_CONFIG:-0}"
+export G_OPD_PROGRESS_DEBUG="${G_OPD_PROGRESS_DEBUG:-0}"
+export GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-0}"
 
 cd /workspace/opd1/verl
+
+G_OPD_ENV_FILE="${G_OPD_ENV_FILE:-/workspace/opd1/verl/.env}"
+if [ -f "$G_OPD_ENV_FILE" ]; then
+    case "$-" in
+        *x*) G_OPD_RESTORE_XTRACE=1; set +x ;;
+        *) G_OPD_RESTORE_XTRACE=0 ;;
+    esac
+    set -a
+    # shellcheck disable=SC1090
+    . "$G_OPD_ENV_FILE"
+    set +a
+    if [ "$G_OPD_RESTORE_XTRACE" = 1 ]; then
+        set -x
+    fi
+    unset G_OPD_RESTORE_XTRACE
+fi
 
 TRAIN_SRC="${TRAIN_SRC:-/workspace/opd1/data/train-00000-of-00001.parquet}"
 TRAIN_FILE="${TRAIN_FILE:-/workspace/opd1/verl/train_verl.parquet}"
@@ -235,16 +257,17 @@ rm -rf /workspace/ray_tmp
 mkdir -p /workspace/ray_tmp
 
 GPT_ROLLOUT_SCORE_ENABLE="${GPT_ROLLOUT_SCORE_ENABLE:-True}"
-GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-gpt-4.1-mini}"
+GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-gpt-5.5-2026-04-23}"
 GPT_ROLLOUT_SCORE_MAX_WORKERS="${GPT_ROLLOUT_SCORE_MAX_WORKERS:-8}"
 GPT_ROLLOUT_SCORE_TIMEOUT="${GPT_ROLLOUT_SCORE_TIMEOUT:-60}"
 GPT_ROLLOUT_SCORE_RETRIES="${GPT_ROLLOUT_SCORE_RETRIES:-2}"
 GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS="${GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS:-8000}"
 GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS="${GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS:-16000}"
-GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS:-1024}"
+GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS:-4096}"
 GPT_ROLLOUT_SCORE_MIN_SCORE_100="${GPT_ROLLOUT_SCORE_MIN_SCORE_100:-50}"
 GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS="${GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS:-1}"
 GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS:-512}"
+GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-0}"
 GPT_ROLLOUT_DATA_DIR="${GPT_ROLLOUT_DATA_DIR:-/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K/rollout_data}"
 
 case "$GPT_ROLLOUT_SCORE_ENABLE" in
@@ -298,7 +321,6 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.rollout.name=vllm \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
         actor_rollout_ref.rollout.n=1 \
-        +env.rollout.n=8 \
         actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
         actor_rollout_ref.rollout.temperature=1.0 \
         actor_rollout_ref.rollout.top_p=1.0 \
@@ -321,6 +343,7 @@ python3 -m verl.trainer.main_ppo \
         trainer.gpt_rollout_score.min_score_100="$GPT_ROLLOUT_SCORE_MIN_SCORE_100" \
         trainer.gpt_rollout_score.max_rerollout_attempts="$GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS" \
         trainer.gpt_rollout_score.max_reroll_feedback_tokens="$GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS" \
+        trainer.gpt_rollout_score.verbose="$GPT_ROLLOUT_SCORE_VERBOSE" \
         trainer.rollout_data_dir="$GPT_ROLLOUT_DATA_DIR" \
         trainer.critic_warmup=0 \
         trainer.val_before_train=True \
