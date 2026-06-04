@@ -155,13 +155,15 @@ trainer:
     max_workers: 8
     timeout: 60
     retries: 2
-    max_prompt_chars: 8000
-    max_response_chars: 16000
+    # Legacy key names; values are interpreted as student-tokenizer token limits.
+    max_prompt_chars: 2048
+    max_response_chars: 4096
     max_output_tokens: 1024
     min_score_100: 50
     max_rerollout_attempts: 1
     max_reroll_context_tokens: 1024
     reroll_summary_model: null
+    reroll_summary_max_workers: null
     reroll_summary_max_output_tokens: 1024
 
     # Directory for low GPT-score case study JSONL dumps; no dump if null.

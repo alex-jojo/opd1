@@ -22,11 +22,12 @@ _LOG_LOCK = threading.Lock()
 
 EVALUATION_PROMPT_TEMPLATE = """You are a mathematical solution quality evaluation model. Your task is to score a given solution based on the provided [Problem], [Ground Truth Answer], and [Solution to Evaluate].
 Please note: the [Ground Truth Answer] contains only the final correct answer and does not include a reference solution or intermediate reasoning. Therefore, you should not require the evaluated solution to match any specific solution method. Instead, you should independently judge whether the mathematical reasoning is valid, whether the final answer is correct, and whether the explanation is clear and reasonable.
-Please score the solution strictly according to the following 5 rubrics. Each rubric should receive an integer score from 1 to 4:
-4 points: Excellent performance, with almost no obvious issues.
-3 points: Generally good, with only minor flaws.
-2 points: Contains clear issues, but still has some reasonable content.
-1 point: Poor performance, with serious errors, missing reasoning, or content that cannot be effectively evaluated.
+Please score the solution strictly according to the following 5 rubrics. Each rubric should receive a numeric score from 1.0 to 4.0, allowing only 0.5-point increments:
+4.0 points: Excellent performance, with almost no obvious issues.
+3.0 points: Generally good, with only minor flaws.
+2.0 points: Contains clear issues, but still has some reasonable content.
+1.0 point: Poor performance with no effective mathematical content, content that is completely impossible to evaluate, or content unrelated to the problem.
+Use 0.5-point scores, such as 2.5 or 3.5, when the quality falls between two adjacent anchor levels.
 
 Scoring principles:
 Do not automatically give a high score just because the final answer is correct; the reasoning process must also be reasonable.
@@ -35,25 +36,30 @@ Do not write a new complete solution; only evaluate the given solution itself.
 If the reasoning process is correct but the final answer is wrong, lower the score for "Answer Correctness and Verifiability", and adjust other scores appropriately based on the source of the error.
 If the final answer is correct but the reasoning is wrong, severely incomplete, or appears to rely on guessing, lower the scores for "Mathematical Rigor" and "Solution Reasonableness".
 If the solution contains multiple mutually contradictory answers, lower the score for "Answer Correctness and Verifiability".
+If the solution contains partially correct key intermediate expressions, transformations, formulas, computations, or reasoning steps that are relevant to the problem, give at least 2.0 for the applicable rubric(s), even if the solution is incomplete or has later mistakes.
 If the final percentage score is below 50, provide a concise revision suggestion. If the final score is greater than or equal to 50, do not provide a revision suggestion.
 
 Rubric 1: Mathematical Rigor
 Weight: 25%
 Evaluate whether the mathematical reasoning in the solution is rigorous and reliable.
+Assign 1.0 only when there is no effective mathematical content, the content is completely impossible to evaluate, or the response is unrelated to the problem.
 Scoring criteria:
 Whether the reasoning chain is valid, and whether each step follows naturally from the problem statement, definitions, theorems, or previous steps.
 Whether there are issues such as skipped steps, circular reasoning, unsupported intuition-based claims, or reasoning backward from the conclusion.
 Whether key conditions are fully used, such as integer constraints, positivity, ranges, uniqueness, extrema, divisibility, distinctness, and other restrictions.
 For problems requiring case analysis, whether all cases are covered and impossible cases are reasonably eliminated.
+If some key intermediate reasoning, equations, transformations, or case setup is mathematically valid and relevant, the score for this rubric should be at least 2.0. Give 1.0 only when the solution has no valid mathematical reasoning, is impossible to evaluate, or is unrelated to the problem.
 
 Rubric 2: Answer Correctness and Verifiability
 Weight: 20%
 Evaluate whether the final answer is correct, clear, and easy to verify.
+Assign 1.0 only when there is no effective mathematical content, the content is completely impossible to evaluate, or the response is unrelated to the problem.
 Scoring criteria:
 Whether the final answer matches the ground truth answer, especially regarding signs, integer form, modular results, or any special output format required by the problem.
 Whether the final answer is clear and unique, without multiple mutually contradictory answers.
 Whether the answer follows naturally from the preceding derivation, rather than being suddenly stated or guessed.
 Whether the final answer is expressed clearly, avoiding ambiguity, redundancy, or forms that are difficult to parse.
+If the final answer is wrong but the solution includes a clearly correct, relevant, and verifiable intermediate result, or the mistake is only a small final arithmetic, sign, simplification, or formatting error, the score for this rubric should be at least 2.0. Give 1.0 only when there is no meaningful answer to verify, the stated answer is unrelated to the problem, or the response is impossible to evaluate.
 
 Rubric 3: Expression Fluency
 Weight: 15%
@@ -83,7 +89,7 @@ Whether it uses a relatively natural, stable, and less error-prone solution path
 Whether the solution reflects reusable mathematical thinking, rather than an accidental operation tailored only to a single answer.
 
 Total Score Calculation
-Each rubric receives an integer score from 1 to 4.
+Each rubric receives a numeric score from 1.0 to 4.0 in 0.5-point increments.
 The weighted score is calculated as follows:
 Weighted Score =
 Mathematical Rigor * 0.25
@@ -91,7 +97,7 @@ Answer Correctness and Verifiability * 0.20
 Expression Fluency * 0.15
 Expression Conciseness * 0.15
 Solution Reasonableness * 0.25
-The final weighted score ranges from 1 to 4.
+The final weighted score ranges from 1.0 to 4.0.
 The percentage score is:
 Final Score = Weighted Score / 4 * 100
 If final_score_100 < 50, provide a concise revision suggestion in the revision_suggestion field.
@@ -187,12 +193,43 @@ def _to_text(value: Any) -> str:
         return str(value)
 
 
-def _truncate_middle(text: str, max_chars: int) -> str:
-    if max_chars <= 0 or len(text) <= max_chars:
+TRUNCATION_MARKER = "\n...[truncated]...\n"
+
+
+def _encode_text(tokenizer: Any, text: str) -> list[int]:
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        token_ids = tokenizer.encode(text)
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    return list(token_ids)
+
+
+def _decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
+    try:
+        return tokenizer.decode(token_ids, skip_special_tokens=True)
+    except TypeError:
+        return tokenizer.decode(token_ids)
+
+
+def _truncate_middle_tokens(text: str, tokenizer: Any, max_tokens: int) -> str:
+    if max_tokens <= 0:
         return text
-    head = max_chars // 3
-    tail = max_chars - head
-    return text[:head] + "\n...[truncated]...\n" + text[-tail:]
+
+    token_ids = _encode_text(tokenizer, text)
+    if len(token_ids) <= max_tokens:
+        return text
+
+    marker_ids = _encode_text(tokenizer, TRUNCATION_MARKER)
+    if len(marker_ids) >= max_tokens:
+        return _decode_token_ids(tokenizer, token_ids[:max_tokens])
+
+    kept_tokens = max_tokens - len(marker_ids)
+    head = kept_tokens // 3
+    tail = kept_tokens - head
+    tail_ids = token_ids[-tail:] if tail > 0 else []
+    return _decode_token_ids(tokenizer, token_ids[:head] + marker_ids + tail_ids)
 
 
 def _extract_response_text(response: dict[str, Any]) -> str:
@@ -227,7 +264,7 @@ def _rubric_score_schema(weight: float) -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "score": {"type": "integer", "minimum": 1, "maximum": 4},
+            "score": {"type": "number", "enum": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]},
             "weight": {"type": "number", "enum": [weight]},
             "reason": {"type": "string"},
         },
@@ -414,8 +451,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
     timeout = float(_get(config, "timeout", 60))
     retries = int(_get(config, "retries", 2))
     max_workers = max(1, int(_get(config, "max_workers", 8)))
-    max_prompt_chars = int(_get(config, "max_prompt_chars", 8000))
-    max_response_chars = int(_get(config, "max_response_chars", 16000))
+    max_prompt_tokens = int(_get(config, "max_prompt_chars", 2048))
+    max_response_tokens = int(_get(config, "max_response_chars", 4096))
     max_output_tokens = int(_get(config, "max_output_tokens", 1024))
     verbose = _to_bool(_get(config, "verbose", os.environ.get("GPT_ROLLOUT_SCORE_VERBOSE", "0")))
 
@@ -430,6 +467,7 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
         _debug_print(
             f"batch start requests={batch_size} max_workers={worker_count} model={model} "
             f"timeout={timeout:g}s retries={retries} max_output_tokens={max_output_tokens} "
+            f"max_prompt_tokens={max_prompt_tokens} max_response_tokens={max_response_tokens} "
             f"reasoning_effort={_optional_str(reasoning_effort) or 'default'} api_url={api_url}"
         )
 
@@ -457,9 +495,9 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
                 "api_url": api_url,
                 "api_key": api_key,
                 "model": model,
-                "problem": _truncate_middle(_to_text(problem), max_prompt_chars),
-                "response": _truncate_middle(response_text, max_response_chars),
-                "ground_truth": _truncate_middle(_to_text(ground_truth), max_prompt_chars),
+                "problem": _truncate_middle_tokens(_to_text(problem), tokenizer, max_prompt_tokens),
+                "response": _truncate_middle_tokens(response_text, tokenizer, max_response_tokens),
+                "ground_truth": _truncate_middle_tokens(_to_text(ground_truth), tokenizer, max_prompt_tokens),
                 "timeout": timeout,
                 "retries": retries,
                 "max_output_tokens": max_output_tokens,

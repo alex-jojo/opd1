@@ -927,6 +927,44 @@ class RayPPOTrainer:
                 low_idxs.append(idx)
         return low_idxs
 
+    def _is_gpt_timeout_error(self, error: object) -> bool:
+        error_text = str(error or "").strip().lower()
+        return any(marker in error_text for marker in ("timeout", "timed out", "time out", "time-out"))
+
+    def _get_initial_gpt_timeout_idxs(self, result: dict) -> list[int]:
+        timeout_idxs = []
+        scores_100 = result.get("scores_100", [])
+        errors = result.get("errors", [])
+        for idx, error in enumerate(errors):
+            score_100 = scores_100[idx] if idx < len(scores_100) else None
+            if score_100 is None and self._is_gpt_timeout_error(error):
+                timeout_idxs.append(idx)
+        return timeout_idxs
+
+    def _finite_gpt_score_value(self, score: object) -> Optional[float]:
+        try:
+            score_value = float(score)
+        except (TypeError, ValueError):
+            return None
+        return score_value if np.isfinite(score_value) else None
+
+    def _is_reroll_score_better(self, reroll_score_100: object, initial_score_100: object) -> bool:
+        reroll_value = self._finite_gpt_score_value(reroll_score_100)
+        if reroll_value is None:
+            return False
+
+        initial_value = self._finite_gpt_score_value(initial_score_100)
+        if initial_value is None:
+            return True
+
+        return reroll_value > initial_value
+
+    def _select_gpt_rollout_result(self, result: dict, positions: list[int]) -> dict:
+        return {
+            key: [values[position] for position in positions] if isinstance(values, list) else values
+            for key, values in result.items()
+        }
+
     def _render_reroll_context(self, previous_solution: str, feedback: dict) -> str:
         feedback_json = json.dumps(feedback, ensure_ascii=False)
         return (
@@ -949,14 +987,7 @@ class RayPPOTrainer:
             "End with the final answer."
         )
 
-    def _format_gpt_feedback_for_reroll(
-        self,
-        result: dict,
-        idx: int,
-        problem: str = "",
-        previous_solution: str = "",
-        scorer_config: Optional[dict] = None,
-    ) -> str:
+    def _build_gpt_feedback_for_reroll_context(self, result: dict, idx: int, previous_solution: str = "") -> str:
         rubric_scores = result["rubric_scores"][idx]
         revision_suggestion = result["revision_suggestions"][idx]
 
@@ -978,7 +1009,34 @@ class RayPPOTrainer:
         if not feedback:
             return ""
 
-        reroll_context = self._render_reroll_context(previous_solution=previous_solution, feedback=feedback)
+        return self._render_reroll_context(previous_solution=previous_solution, feedback=feedback)
+
+    def _get_reroll_summary_max_workers(self, scorer_config: dict, job_count: int) -> int:
+        raw_value = scorer_config.get("reroll_summary_max_workers", None)
+        if raw_value is None:
+            raw_value = scorer_config.get("max_workers", 8)
+        try:
+            max_workers = int(raw_value)
+        except (TypeError, ValueError):
+            max_workers = 8
+        return min(max(max_workers, 1), max(job_count, 1))
+
+    def _format_gpt_feedback_for_reroll(
+        self,
+        result: dict,
+        idx: int,
+        problem: str = "",
+        previous_solution: str = "",
+        scorer_config: Optional[dict] = None,
+    ) -> str:
+        reroll_context = self._build_gpt_feedback_for_reroll_context(
+            result=result,
+            idx=idx,
+            previous_solution=previous_solution,
+        )
+        if not reroll_context:
+            return ""
+
         if scorer_config is None:
             return self._render_reroll_prompt_suffix(problem=problem, reroll_context=reroll_context)
 
@@ -1055,7 +1113,7 @@ class RayPPOTrainer:
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
 
-        appended_count = 0
+        feedback_requests = []
         for idx in row_idxs:
             valid_prompt_len = int(attention_mask[idx].sum().item())
             if valid_prompt_len > 0:
@@ -1084,21 +1142,86 @@ class RayPPOTrainer:
                     skip_special_tokens=True,
                 )
 
-            feedback_text = self._format_gpt_feedback_for_reroll(
-                initial_score_result,
-                idx,
-                problem=problem,
+            reroll_context = self._build_gpt_feedback_for_reroll_context(
+                result=initial_score_result,
+                idx=idx,
                 previous_solution=previous_solution,
-                scorer_config=scorer_config,
             )
-            if not feedback_text:
+            if not reroll_context:
                 continue
 
+            context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
+            feedback_requests.append(
+                {
+                    "idx": idx,
+                    "valid_prompt_ids": valid_prompt_ids,
+                    "problem": problem,
+                    "reroll_context": reroll_context,
+                    "needs_summary": len(context_ids) > max_context_tokens,
+                }
+            )
+
+        summary_results = {}
+        summary_jobs = [request for request in feedback_requests if request["needs_summary"]]
+        if summary_jobs:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from verl.trainer.ppo.gpt_rollout_scorer import summarize_reroll_context_with_gpt
+
+            summary_max_workers = self._get_reroll_summary_max_workers(scorer_config, len(summary_jobs))
+            self._debug_progress(
+                f"gpt_reroll_summary:start count={len(summary_jobs)} max_workers={summary_max_workers}"
+            )
+            with ThreadPoolExecutor(max_workers=summary_max_workers) as executor:
+                future_to_request = {
+                    executor.submit(
+                        summarize_reroll_context_with_gpt,
+                        context=request["reroll_context"],
+                        target_tokens=max_context_tokens,
+                        config=scorer_config,
+                        request_idx=request["idx"] + 1,
+                        verbose=_is_truthy(scorer_config.get("verbose", False)),
+                    ): request
+                    for request in summary_jobs
+                }
+                for future in as_completed(future_to_request):
+                    request = future_to_request[future]
+                    try:
+                        summary = future.result()
+                    except Exception as exc:
+                        summary = {
+                            "reroll_context": "",
+                            "error": str(exc),
+                        }
+                    summary_results[request["idx"]] = summary
+            self._debug_progress(f"gpt_reroll_summary:done count={len(summary_jobs)}")
+
+        appended_count = 0
+        for request in feedback_requests:
+            idx = request["idx"]
+            reroll_context = request["reroll_context"]
+            if request["needs_summary"]:
+                summary = summary_results.get(idx, {})
+                if summary.get("error"):
+                    self._debug_progress(f"gpt_reroll_summary:failed idx={idx} error={str(summary['error'])[:240]}")
+                reroll_context = summary.get("reroll_context") or reroll_context
+
+            context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
+            if len(context_ids) > max_context_tokens:
+                self._debug_progress(
+                    f"gpt_reroll_context:summary_still_too_long idx={idx} tokens={len(context_ids)} "
+                    f"limit={max_context_tokens}; applying context tail fallback"
+                )
+                reroll_context = self.tokenizer.decode(context_ids[-max_context_tokens:], skip_special_tokens=True)
+
+            feedback_text = self._render_reroll_prompt_suffix(
+                problem=request["problem"],
+                reroll_context=reroll_context,
+            )
             feedback_ids = self.tokenizer.encode(feedback_text, add_special_tokens=False)
             if not feedback_ids:
                 continue
 
-            combined_ids = valid_prompt_ids + feedback_ids
+            combined_ids = request["valid_prompt_ids"] + feedback_ids
             if len(combined_ids) > prompt_length:
                 combined_ids = combined_ids[-prompt_length:]
 
@@ -1189,12 +1312,18 @@ class RayPPOTrainer:
         configured_max_attempts = int(scorer_config.get("max_rerollout_attempts", 1))
         max_attempts = min(max(configured_max_attempts, 0), 1)
         reroll_counts = np.zeros(len(batch), dtype=object)
-        low_idxs = self._get_low_gpt_score_idxs(initial_score_result["scores_100"], threshold_100)
+        raw_low_idxs = self._get_low_gpt_score_idxs(initial_score_result["scores_100"], threshold_100)
+        initial_timeout_idxs = self._get_initial_gpt_timeout_idxs(initial_score_result)
+        initial_timeout_idx_set = set(initial_timeout_idxs)
+        low_idxs = [idx for idx in raw_low_idxs if idx not in initial_timeout_idx_set]
         metrics["gpt_rollout_reroll/initial_low_count"] = len(low_idxs)
+        metrics["gpt_rollout_reroll/initial_low_or_error_count"] = len(raw_low_idxs)
+        metrics["gpt_rollout_reroll/initial_timeout_passthrough_count"] = len(initial_timeout_idxs)
         metrics["gpt_rollout_reroll/threshold_100"] = threshold_100
         metrics["gpt_rollout_reroll/max_attempts"] = max_attempts
         self._debug_progress(
-            f"gpt_reroll:start low_count={len(low_idxs)} threshold_100={threshold_100} max_attempts={max_attempts}"
+            f"gpt_reroll:start low_count={len(low_idxs)} timeout_passthrough={len(initial_timeout_idxs)} "
+            f"threshold_100={threshold_100} max_attempts={max_attempts}"
         )
         metrics["gpt_rollout_reroll/configured_max_attempts"] = configured_max_attempts
 
@@ -1227,15 +1356,72 @@ class RayPPOTrainer:
                     timing_raw[f"gpt_reroll_{attempt + 1}/{key}"] = value
                 reroll_output.meta_info.pop("timing", None)
 
-            rerolled_idxs = list(low_idxs)
-            self._replace_rollout_rows(batch=batch, rollout_output=reroll_output, row_idxs=low_idxs)
-            for idx in low_idxs:
+            reroll_scoring_batch = batch.select_idxs(low_idxs)
+            self._replace_rollout_rows(
+                batch=reroll_scoring_batch,
+                rollout_output=reroll_output,
+                row_idxs=list(range(len(low_idxs))),
+            )
+            reroll_scoring_batch.batch["response_mask"] = compute_response_mask(reroll_scoring_batch)
+
+            self._debug_progress(
+                f"gpt_reroll_rescore:start attempt={attempt + 1}/{max_attempts} count={len(low_idxs)}"
+            )
+            reroll_score_result = self._score_gpt_rollouts(
+                batch=reroll_scoring_batch,
+                scorer_config=scorer_config,
+                timing_raw=timing_raw,
+                timer_name=f"gpt_reroll_score_{attempt + 1}",
+            )
+            self._debug_progress(
+                f"gpt_reroll_rescore:done attempt={attempt + 1}/{max_attempts} count={len(low_idxs)}"
+            )
+
+            accepted_output_positions = []
+            accepted_batch_idxs = []
+            rejected_batch_idxs = []
+            for output_position, idx in enumerate(low_idxs):
+                if self._is_reroll_score_better(
+                    reroll_score_result["scores_100"][output_position],
+                    initial_score_result["scores_100"][idx],
+                ):
+                    accepted_output_positions.append(output_position)
+                    accepted_batch_idxs.append(idx)
+                    continue
+                rejected_batch_idxs.append(idx)
+
+            if accepted_batch_idxs:
+                accepted_reroll_output = reroll_output.select_idxs(accepted_output_positions)
+                self._replace_rollout_rows(
+                    batch=batch,
+                    rollout_output=accepted_reroll_output,
+                    row_idxs=accepted_batch_idxs,
+                )
+                accepted_score_result = self._select_gpt_rollout_result(
+                    reroll_score_result,
+                    accepted_output_positions,
+                )
+                self._set_gpt_rollout_result(
+                    batch=batch,
+                    result=accepted_score_result,
+                    prefix="gpt_rollout",
+                    threshold_100=threshold_100,
+                    row_idxs=accepted_batch_idxs,
+                )
+                batch.batch["response_mask"] = compute_response_mask(batch)
+
+            for idx in accepted_batch_idxs:
                 reroll_counts[idx] = int(reroll_counts[idx]) + 1
 
-            batch.batch["response_mask"] = compute_response_mask(batch)
-            self._mark_gpt_rollout_result_unscored_after_reroll(batch=batch, row_idxs=rerolled_idxs)
-            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rerolled_count"] = len(rerolled_idxs)
-            self._debug_progress(f"gpt_reroll_generate:done attempt={attempt + 1}/{max_attempts} count={len(rerolled_idxs)}")
+            reroll_valid_count = sum(score is not None for score in reroll_score_result["scores_100"])
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_generated_count"] = len(low_idxs)
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rescore_valid_count"] = reroll_valid_count
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rerolled_count"] = len(accepted_batch_idxs)
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rejected_count"] = len(rejected_batch_idxs)
+            self._debug_progress(
+                f"gpt_reroll_select:done attempt={attempt + 1}/{max_attempts} "
+                f"accepted={len(accepted_batch_idxs)} rejected={len(rejected_batch_idxs)}"
+            )
             low_idxs = []
 
         batch.non_tensor_batch["gpt_rollout_reroll_count"] = reroll_counts
@@ -1247,7 +1433,11 @@ class RayPPOTrainer:
         )
         final_scores = batch.non_tensor_batch["gpt_rollout_score"].tolist()
         final_scores_100 = batch.non_tensor_batch["gpt_rollout_score_100"].tolist()
-        final_low_idxs = self._get_low_gpt_score_idxs(final_scores_100, threshold_100)
+        final_low_idxs = [
+            idx
+            for idx in self._get_low_gpt_score_idxs(final_scores_100, threshold_100)
+            if idx not in initial_timeout_idx_set
+        ]
         self._log_gpt_rollout_score_metrics(
             metrics=metrics,
             scores=final_scores,
@@ -1258,9 +1448,11 @@ class RayPPOTrainer:
         metrics["gpt_rollout_reroll/final_low_count"] = len(final_low_idxs)
         metrics["gpt_rollout_reroll/rerolled_count"] = int(sum(int(count) > 0 for count in reroll_counts))
         metrics["gpt_rollout_reroll/total_rerolls"] = int(sum(int(count) for count in reroll_counts))
-        metrics["gpt_rollout_reroll/rescore_skipped_count"] = metrics["gpt_rollout_reroll/total_rerolls"]
+        metrics["gpt_rollout_reroll/rescore_skipped_count"] = 0
         self._debug_progress(
-            f"gpt_reroll:done final_low_count={len(final_low_idxs)} total_rerolls={metrics['gpt_rollout_reroll/total_rerolls']} rescore_skipped_count={metrics['gpt_rollout_reroll/rescore_skipped_count']}"
+            f"gpt_reroll:done final_low_count={len(final_low_idxs)} "
+            f"accepted_rerolls={metrics['gpt_rollout_reroll/total_rerolls']} "
+            f"rescore_skipped_count={metrics['gpt_rollout_reroll/rescore_skipped_count']}"
         )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
