@@ -110,6 +110,26 @@ Input Format
 Output Format
 Please strictly output in the requested JSON schema and do not output any extra text."""
 
+REROLL_CONTEXT_SUMMARY_PROMPT_TEMPLATE = """Compress the reroll context below so it can be appended to a student model prompt.
+
+Requirements:
+- Compress the [Previous Solution] and [GPT Feedback on Previous Solution] together in one pass.
+- Return a single reroll_context string that still contains both section headers, in this order:
+  [Previous Solution]
+  [GPT Feedback on Previous Solution]
+- Do not include the problem statement or the final "solve again" instruction in reroll_context.
+- Do not solve the math problem again.
+- Do not improve, correct, or polish the previous solution beyond compression.
+- If the previous solution is wrong, vague, repetitive, disorganized, or overly verbose, preserve that quality and meaning.
+- Preserve all important mistakes, contradictions, final answers, and reasoning choices from the previous solution.
+- Preserve actionable GPT feedback, low rubric scores, and revision suggestions.
+- The entire returned reroll_context must be at most {target_tokens} student-tokenizer tokens.
+
+[Reroll Context To Compress: Previous Solution + GPT Feedback]
+{context}
+
+Return only JSON matching the schema."""
+
 
 def _get(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
@@ -248,6 +268,37 @@ def _score_schema() -> dict[str, Any]:
     }
 
 
+def _reroll_context_summary_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "reroll_context": {"type": "string"},
+        },
+        "required": ["reroll_context"],
+        "additionalProperties": False,
+    }
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "false", "0", "default"}:
+        return None
+    return text
+
+
+def _model_supports_reasoning_effort(model: str) -> bool:
+    normalized = str(model).lower()
+    return normalized.startswith("gpt-5") or normalized.startswith("o")
+
+
+def _add_reasoning_effort(payload: dict[str, Any], model: str, reasoning_effort: str | None) -> None:
+    reasoning_effort = _optional_str(reasoning_effort)
+    if reasoning_effort is not None and _model_supports_reasoning_effort(model):
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+
 def _score_one(
     *,
     api_url: str,
@@ -259,6 +310,7 @@ def _score_one(
     timeout: float,
     retries: int,
     max_output_tokens: int,
+    reasoning_effort: str | None,
     request_idx: int,
     request_count: int,
     verbose: bool,
@@ -290,6 +342,7 @@ def _score_one(
         },
         "max_output_tokens": max_output_tokens,
     }
+    _add_reasoning_effort(payload, model, reasoning_effort)
 
     last_error = ""
     total_attempts = retries + 1
@@ -356,7 +409,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
 
     base_url = _get(config, "base_url", None) or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     api_url = base_url.rstrip("/") + "/responses"
-    model = _get(config, "model", "gpt-4.1-mini")
+    model = _get(config, "model", "chat-latest") or "chat-latest"
+    reasoning_effort = _get(config, "reasoning_effort", os.environ.get("GPT_ROLLOUT_SCORE_REASONING_EFFORT", None))
     timeout = float(_get(config, "timeout", 60))
     retries = int(_get(config, "retries", 2))
     max_workers = max(1, int(_get(config, "max_workers", 8)))
@@ -375,7 +429,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
     if verbose:
         _debug_print(
             f"batch start requests={batch_size} max_workers={worker_count} model={model} "
-            f"timeout={timeout:g}s retries={retries} max_output_tokens={max_output_tokens} api_url={api_url}"
+            f"timeout={timeout:g}s retries={retries} max_output_tokens={max_output_tokens} "
+            f"reasoning_effort={_optional_str(reasoning_effort) or 'default'} api_url={api_url}"
         )
 
     extra_infos = _to_list(batch.non_tensor_batch.get("extra_info"), batch_size, {})
@@ -408,6 +463,7 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
                 "timeout": timeout,
                 "retries": retries,
                 "max_output_tokens": max_output_tokens,
+                "reasoning_effort": reasoning_effort,
                 "request_idx": i + 1,
                 "request_count": batch_size,
                 "verbose": verbose,
@@ -475,4 +531,96 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
         "revision_suggestions": [result["revision_suggestion"] for result in results],
         "errors": [result["error"] for result in results],
         "models": [model for _ in results],
+    }
+
+
+def summarize_reroll_context_with_gpt(
+    *,
+    context: str,
+    target_tokens: int,
+    config: Any,
+    request_idx: int,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required when reroll context summarization is enabled")
+
+    base_url = _get(config, "base_url", None) or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    api_url = base_url.rstrip("/") + "/responses"
+    model = _get(config, "reroll_summary_model", None) or _get(config, "model", "chat-latest") or "chat-latest"
+    reasoning_effort = _get(config, "reasoning_effort", os.environ.get("GPT_ROLLOUT_SCORE_REASONING_EFFORT", None))
+    timeout = float(_get(config, "timeout", 60))
+    retries = int(_get(config, "retries", 2))
+    max_output_tokens = int(_get(config, "reroll_summary_max_output_tokens", 1024))
+    user_prompt = REROLL_CONTEXT_SUMMARY_PROMPT_TEMPLATE.format(
+        target_tokens=target_tokens,
+        context=context,
+    )
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": (
+                    "Compress reroll context for a math training pipeline. Preserve the previous solution's "
+                    "meaning, quality, flaws, and the GPT feedback. Return only JSON matching the schema."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "reroll_context_summary",
+                "strict": True,
+                "schema": _reroll_context_summary_schema(),
+            }
+        },
+        "max_output_tokens": max_output_tokens,
+    }
+    _add_reasoning_effort(payload, model, reasoning_effort)
+
+    last_error = ""
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        attempt_start = time.time()
+        if verbose:
+            _debug_print(
+                f"reroll_summary request_idx={request_idx} attempt={attempt + 1}/{total_attempts} "
+                f"model={model} context_chars={len(context)} target_tokens={target_tokens} "
+                f"max_output_tokens={max_output_tokens} reasoning_effort={_optional_str(reasoning_effort) or 'default'}"
+            )
+        try:
+            api_response = _post_json(api_url, api_key, payload, timeout)
+            text = _extract_response_text(api_response)
+            parsed = json.loads(text)
+            if verbose:
+                _debug_print(
+                    f"reroll_summary request_idx={request_idx} done elapsed={time.time() - attempt_start:.1f}s"
+                )
+            return {
+                "reroll_context": str(parsed["reroll_context"]),
+                "model": model,
+                "error": "",
+            }
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = f"HTTP {exc.code}: {body}"
+        except Exception as exc:
+            last_error = str(exc)
+
+        if verbose:
+            status = "retry" if attempt < retries else "failed"
+            _debug_print(
+                f"reroll_summary request_idx={request_idx} attempt={attempt + 1}/{total_attempts} {status} "
+                f"elapsed={time.time() - attempt_start:.1f}s error={_format_error(last_error)}"
+            )
+        if attempt < retries:
+            time.sleep(min(2**attempt, 8))
+
+    return {
+        "reroll_context": "",
+        "model": model,
+        "error": last_error,
     }

@@ -256,7 +256,10 @@ ray stop --force || true
 rm -rf /workspace/ray_tmp
 mkdir -p /workspace/ray_tmp
 
-G_OPD_CKPT_DIR="${G_OPD_CKPT_DIR:-/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K}"
+G_OPD_EXPERIMENT_NAME="${G_OPD_EXPERIMENT_NAME:-qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_rubric}"
+G_OPD_SAVE_FREQ="${G_OPD_SAVE_FREQ:-50}"
+G_OPD_DEFAULT_CKPT_DIR="/G-OPD-checkpoints/${G_OPD_EXPERIMENT_NAME}_save_step_${G_OPD_SAVE_FREQ}"
+G_OPD_CKPT_DIR="${G_OPD_CKPT_DIR:-$G_OPD_DEFAULT_CKPT_DIR}"
 G_OPD_RESUME_MODE="${G_OPD_RESUME_MODE:-disable}"
 G_OPD_RESUME_FROM_PATH="${G_OPD_RESUME_FROM_PATH:-null}"
 
@@ -269,18 +272,25 @@ case "$G_OPD_RESUME_MODE" in
 esac
 
 GPT_ROLLOUT_SCORE_ENABLE="${GPT_ROLLOUT_SCORE_ENABLE:-True}"
-GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-gpt-5.5-2026-04-23}"
+GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-chat-latest}"
+GPT_ROLLOUT_SCORE_REASONING_EFFORT="${GPT_ROLLOUT_SCORE_REASONING_EFFORT:-none}"
 GPT_ROLLOUT_SCORE_MAX_WORKERS="${GPT_ROLLOUT_SCORE_MAX_WORKERS:-32}"
 GPT_ROLLOUT_SCORE_TIMEOUT="${GPT_ROLLOUT_SCORE_TIMEOUT:-60}"
 GPT_ROLLOUT_SCORE_RETRIES="${GPT_ROLLOUT_SCORE_RETRIES:-2}"
 GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS="${GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS:-8000}"
 GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS="${GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS:-16000}"
-GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS:-4096}"
+GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS:-2048}"
 GPT_ROLLOUT_SCORE_MIN_SCORE_100="${GPT_ROLLOUT_SCORE_MIN_SCORE_100:-50}"
 GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS="${GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS:-1}"
-GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS:-512}"
+GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS:-1024}"
+GPT_ROLLOUT_SCORE_REROLL_SUMMARY_MODEL="${GPT_ROLLOUT_SCORE_REROLL_SUMMARY_MODEL:-$GPT_ROLLOUT_SCORE_MODEL}"
+GPT_ROLLOUT_SCORE_REROLL_SUMMARY_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_REROLL_SUMMARY_MAX_OUTPUT_TOKENS:-1024}"
 GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-0}"
 GPT_ROLLOUT_DATA_DIR="${GPT_ROLLOUT_DATA_DIR:-$G_OPD_CKPT_DIR/rollout_data}"
+GPT_ROLLOUT_SCORE_CASE_STUDY_DIR="${GPT_ROLLOUT_SCORE_CASE_STUDY_DIR:-$G_OPD_CKPT_DIR/gpt_low_score_cases}"
+GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP="${GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP:-20}"
+GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100="${GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100:-$GPT_ROLLOUT_SCORE_MIN_SCORE_100}"
+GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS="${GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS:-True
 
 case "$GPT_ROLLOUT_SCORE_ENABLE" in
     True|true|1|yes|YES)
@@ -339,13 +349,14 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.rollout.val_kwargs.do_sample=True \
         actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
         actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-        actor_rollout_ref.rollout.val_kwargs.n=8 \
+        actor_rollout_ref.rollout.val_kwargs.n=1 \
         actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
         reward_model.reward_manager=naive \
         trainer.gpt_rollout_score.enable="$GPT_ROLLOUT_SCORE_ENABLE" \
         trainer.gpt_rollout_score.model="$GPT_ROLLOUT_SCORE_MODEL" \
+        trainer.gpt_rollout_score.reasoning_effort="$GPT_ROLLOUT_SCORE_REASONING_EFFORT" \
         trainer.gpt_rollout_score.max_workers="$GPT_ROLLOUT_SCORE_MAX_WORKERS" \
         trainer.gpt_rollout_score.timeout="$GPT_ROLLOUT_SCORE_TIMEOUT" \
         trainer.gpt_rollout_score.retries="$GPT_ROLLOUT_SCORE_RETRIES" \
@@ -354,7 +365,13 @@ python3 -m verl.trainer.main_ppo \
         trainer.gpt_rollout_score.max_output_tokens="$GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS" \
         trainer.gpt_rollout_score.min_score_100="$GPT_ROLLOUT_SCORE_MIN_SCORE_100" \
         trainer.gpt_rollout_score.max_rerollout_attempts="$GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS" \
-        trainer.gpt_rollout_score.max_reroll_feedback_tokens="$GPT_ROLLOUT_SCORE_MAX_REROLL_FEEDBACK_TOKENS" \
+        trainer.gpt_rollout_score.max_reroll_context_tokens="$GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS" \
+        trainer.gpt_rollout_score.reroll_summary_model="$GPT_ROLLOUT_SCORE_REROLL_SUMMARY_MODEL" \
+        trainer.gpt_rollout_score.reroll_summary_max_output_tokens="$GPT_ROLLOUT_SCORE_REROLL_SUMMARY_MAX_OUTPUT_TOKENS" \
+        trainer.gpt_rollout_score.case_study_dir="$GPT_ROLLOUT_SCORE_CASE_STUDY_DIR" \
+        trainer.gpt_rollout_score.case_study_max_per_step="$GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP" \
+        trainer.gpt_rollout_score.case_study_threshold_100="$GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100" \
+        trainer.gpt_rollout_score.case_study_include_errors="$GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS" \
         trainer.gpt_rollout_score.verbose="$GPT_ROLLOUT_SCORE_VERBOSE" \
         trainer.rollout_data_dir="$GPT_ROLLOUT_DATA_DIR" \
         trainer.critic_warmup=0 \
@@ -362,10 +379,10 @@ python3 -m verl.trainer.main_ppo \
         trainer.logger='["console","wandb"]' \
         trainer.log_val_generations=10 \
         trainer.project_name='on-policy-distillation' \
-        trainer.experiment_name='qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_standard_opd_dapo_math_17k' \
+        trainer.experiment_name="$G_OPD_EXPERIMENT_NAME" \
         trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
-        trainer.save_freq=50 \
+        trainer.save_freq="$G_OPD_SAVE_FREQ" \
         trainer.resume_mode="$G_OPD_RESUME_MODE" \
         trainer.resume_from_path="$G_OPD_RESUME_FROM_PATH" \
         trainer.default_local_dir="$G_OPD_CKPT_DIR" \

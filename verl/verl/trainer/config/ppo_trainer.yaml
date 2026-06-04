@@ -149,8 +149,9 @@ trainer:
   # Optional GPT scoring for training rollouts. This is logging-only and does not affect rewards or advantages.
   gpt_rollout_score:
     enable: False
-    model: gpt-4.1-mini
+    model: chat-latest
     base_url: null
+    reasoning_effort: none
     max_workers: 8
     timeout: 60
     retries: 2
@@ -159,7 +160,22 @@ trainer:
     max_output_tokens: 1024
     min_score_100: 50
     max_rerollout_attempts: 1
-    max_reroll_feedback_tokens: 512
+    max_reroll_context_tokens: 1024
+    reroll_summary_model: null
+    reroll_summary_max_output_tokens: 1024
+
+    # Directory for low GPT-score case study JSONL dumps; no dump if null.
+    case_study_dir: null
+
+    # Maximum number of low-score GPT case study samples to save per training step.
+    case_study_max_per_step: 16
+
+    # Score threshold for case study dumps; null means use min_score_100.
+    case_study_threshold_100: null
+
+    # Whether to include GPT scoring errors in case study dumps.
+    case_study_include_errors: False
+
     verbose: False
 
   # Number of nodes used in the training
