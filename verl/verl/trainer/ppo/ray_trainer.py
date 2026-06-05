@@ -689,7 +689,21 @@ class RayPPOTrainer:
                     "output": response_text,
                     "student_first_input": prompt_text,
                     "student_first_output": response_text,
+                    "student_second_input": None,
                     "student_second_output": None,
+                    "student_second_attempted": False,
+                    "student_second_attempt": None,
+                    "student_second_accepted": None,
+                    "student_second_rejected_reason": None,
+                    "student_second_score_delta_100": None,
+                    "student_second_gpt_score": None,
+                    "student_second_gpt_score_100": None,
+                    "student_second_gpt_weighted_score_1_to_4": None,
+                    "student_second_gpt_rubric_scores": None,
+                    "student_second_gpt_reason": "",
+                    "student_second_gpt_revision_suggestion": "",
+                    "student_second_gpt_error": "",
+                    "student_second_gpt_model": None,
                     "student_reroll_count": 0,
                     "problem": extra_info.get("problem") if isinstance(extra_info, dict) else None,
                     "gts": ground_truth,
@@ -741,6 +755,80 @@ class RayPPOTrainer:
                 f"gpt_case_study:dumped selected={selected_count} low_count={low_count} file={filename}"
             )
 
+    def _maybe_record_gpt_case_study_reroll_attempts(
+        self,
+        initial_score_result: dict,
+        reroll_prompt_batch: DataProto,
+        reroll_scoring_batch: DataProto,
+        reroll_score_result: dict,
+        row_idxs: list[int],
+        accepted_batch_idxs: list[int],
+        attempt: int,
+    ) -> None:
+        entries = initial_score_result.get("_case_study_entries")
+        if not entries:
+            return
+
+        entry_by_idx = {int(entry["row_idx"]): entry for entry in entries}
+        accepted_idx_set = set(int(idx) for idx in accepted_batch_idxs)
+        prompt_input_ids = reroll_prompt_batch.batch["input_ids"]
+        prompt_attention_mask = reroll_prompt_batch.batch["attention_mask"]
+        for output_position, idx in enumerate(row_idxs):
+            entry = entry_by_idx.get(int(idx))
+            if entry is None:
+                continue
+
+            valid_prompt_ids = prompt_input_ids[output_position][
+                prompt_attention_mask[output_position].bool()
+            ]
+            second_input = self.tokenizer.decode(
+                valid_prompt_ids.detach().cpu().tolist(),
+                skip_special_tokens=True,
+            )
+            _, second_output = self._decode_rollout_prompt_response(
+                batch=reroll_scoring_batch,
+                idx=output_position,
+            )
+            initial_score_100 = initial_score_result["scores_100"][idx]
+            second_score_100 = reroll_score_result["scores_100"][output_position]
+            initial_score_value = self._finite_gpt_score_value(initial_score_100)
+            second_score_value = self._finite_gpt_score_value(second_score_100)
+            if initial_score_value is None or second_score_value is None:
+                score_delta_100 = None
+            else:
+                score_delta_100 = second_score_value - initial_score_value
+
+            accepted = int(idx) in accepted_idx_set
+            rejected_reason = None
+            if not accepted:
+                rejected_reason = "reroll_score_invalid" if second_score_value is None else "score_not_better"
+
+            entry.update(
+                {
+                    "student_second_input": second_input,
+                    "student_second_output": second_output,
+                    "student_second_attempted": True,
+                    "student_second_attempt": attempt + 1,
+                    "student_second_accepted": accepted,
+                    "student_second_rejected_reason": rejected_reason,
+                    "student_second_score_delta_100": score_delta_100,
+                    "student_second_gpt_score": reroll_score_result["scores"][output_position],
+                    "student_second_gpt_score_100": second_score_100,
+                    "student_second_gpt_weighted_score_1_to_4": reroll_score_result[
+                        "weighted_scores_1_to_4"
+                    ][output_position],
+                    "student_second_gpt_rubric_scores": reroll_score_result["rubric_scores"][
+                        output_position
+                    ],
+                    "student_second_gpt_reason": reroll_score_result["reasons"][output_position],
+                    "student_second_gpt_revision_suggestion": reroll_score_result[
+                        "revision_suggestions"
+                    ][output_position],
+                    "student_second_gpt_error": reroll_score_result["errors"][output_position],
+                    "student_second_gpt_model": reroll_score_result["models"][output_position],
+                }
+            )
+
     def _maybe_update_gpt_case_studies_after_reroll(
         self,
         batch: DataProto,
@@ -755,18 +843,23 @@ class RayPPOTrainer:
 
         selected_count = len(entries)
         updated_count = 0
+        attempted_count = 0
         for entry in entries:
             idx = int(entry["row_idx"])
             reroll_count = int(reroll_counts[idx])
             entry["student_reroll_count"] = reroll_count
+            if entry.get("student_second_attempted"):
+                attempted_count += 1
             if reroll_count <= 0:
                 continue
 
             _, second_output = self._decode_rollout_prompt_response(batch=batch, idx=idx)
             entry["student_second_output"] = second_output
+            entry["student_second_accepted"] = True
+            entry["student_second_rejected_reason"] = None
             updated_count += 1
 
-        if updated_count == 0:
+        if updated_count == 0 and attempted_count == 0:
             return
 
         self._write_gpt_rollout_case_studies(
@@ -776,7 +869,9 @@ class RayPPOTrainer:
             selected_count=selected_count,
             low_count=selected_count,
         )
-        self._debug_progress(f"gpt_case_study:updated_second_outputs count={updated_count}")
+        self._debug_progress(
+            f"gpt_case_study:updated_second_outputs accepted={updated_count} attempted={attempted_count}"
+        )
 
     def _gpt_rollout_result_values(self, result: dict, prefix: str) -> dict:
         return {
@@ -1217,11 +1312,17 @@ class RayPPOTrainer:
                 problem=request["problem"],
                 reroll_context=reroll_context,
             )
-            feedback_ids = self.tokenizer.encode(feedback_text, add_special_tokens=False)
-            if not feedback_ids:
+            apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+            reroll_prompt_text = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": feedback_text}],
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+            combined_ids = self.tokenizer.encode(reroll_prompt_text, add_special_tokens=False)
+            if not combined_ids:
                 continue
 
-            combined_ids = request["valid_prompt_ids"] + feedback_ids
             if len(combined_ids) > prompt_length:
                 combined_ids = combined_ids[-prompt_length:]
 
@@ -1389,6 +1490,16 @@ class RayPPOTrainer:
                     accepted_batch_idxs.append(idx)
                     continue
                 rejected_batch_idxs.append(idx)
+
+            self._maybe_record_gpt_case_study_reroll_attempts(
+                initial_score_result=initial_score_result,
+                reroll_prompt_batch=reroll_gen_batch,
+                reroll_scoring_batch=reroll_scoring_batch,
+                reroll_score_result=reroll_score_result,
+                row_idxs=low_idxs,
+                accepted_batch_idxs=accepted_batch_idxs,
+                attempt=attempt,
+            )
 
             if accepted_batch_idxs:
                 accepted_reroll_output = reroll_output.select_idxs(accepted_output_positions)
@@ -2449,3 +2560,5 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+
