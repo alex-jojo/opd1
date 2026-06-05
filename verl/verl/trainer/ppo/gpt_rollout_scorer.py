@@ -37,7 +37,8 @@ If the reasoning process is correct but the final answer is wrong, lower the sco
 If the final answer is correct but the reasoning is wrong, severely incomplete, or appears to rely on guessing, lower the scores for "Mathematical Rigor" and "Solution Reasonableness".
 If the solution contains multiple mutually contradictory answers, lower the score for "Answer Correctness and Verifiability".
 If the solution contains partially correct key intermediate expressions, transformations, formulas, computations, or reasoning steps that are relevant to the problem, give at least 2.0 for the applicable rubric(s), even if the solution is incomplete or has later mistakes.
-If the final percentage score is below 50, provide a concise revision suggestion. If the final score is greater than or equal to 50, do not provide a revision suggestion.
+If the final percentage score is below 45, provide a concise revision suggestion. If the final score is greater than or equal to 45, do not provide a revision suggestion.
+When writing the revision_suggestion, it should help guide and correct the model's reasoning process rather than directly revealing the correct final answer.
 
 Rubric 1: Mathematical Rigor
 Weight: 25%
@@ -71,7 +72,7 @@ Whether sentences, formulas, and paragraphs connect smoothly, allowing the reade
 Whether the solution avoids disorganized trial-and-error, repeated revisions, sudden shifts in direction, or unexplained formula dumping.
 
 Rubric 4: Expression Conciseness
-Weight: 15%
+Weight: 10%
 Evaluate whether the solution is concise and effective, without obvious redundancy.
 Scoring criteria:
 Whether the solution includes only necessary reasoning and avoids irrelevant background information, small talk, or excessive explanation.
@@ -80,7 +81,7 @@ Whether it completes the proof or computation through a relatively short path wh
 For simple problems, whether it avoids unnecessary overcomplication; for difficult problems, whether it avoids using large amounts of ineffective enumeration to obscure the core idea.
 
 Rubric 5: Solution Reasonableness
-Weight: 25%
+Weight: 30%
 Evaluate whether the chosen solution method is appropriate for the problem, whether it captures the key structure, and whether it is relatively strong among possible solution methods.
 Scoring criteria:
 Whether the chosen method fits the problem type, such as algebraic manipulation, case analysis, construction, counting, number-theoretic reasoning, geometric relationships, and so on.
@@ -95,13 +96,13 @@ Weighted Score =
 Mathematical Rigor * 0.25
 Answer Correctness and Verifiability * 0.20
 Expression Fluency * 0.15
-Expression Conciseness * 0.15
-Solution Reasonableness * 0.25
+Expression Conciseness * 0.10
+Solution Reasonableness * 0.30
 The final weighted score ranges from 1.0 to 4.0.
 The percentage score is:
 Final Score = Weighted Score / 4 * 100
-If final_score_100 < 50, provide a concise revision suggestion in the revision_suggestion field.
-If final_score_100 >= 50, set the revision_suggestion field to an empty string "".
+If final_score_100 < 45, provide a concise revision suggestion in the revision_suggestion field.
+If final_score_100 >= 45, set the revision_suggestion field to an empty string "".
 
 Input Format
 [Problem]
@@ -116,10 +117,11 @@ Input Format
 Output Format
 Please strictly output in the requested JSON schema and do not output any extra text."""
 
-REROLL_CONTEXT_SUMMARY_PROMPT_TEMPLATE = """Compress the reroll context below so it can be appended to a student model prompt.
+REROLL_CONTEXT_SUMMARY_PROMPT_TEMPLATE = """Aggressively compress the reroll context below into one concise paragraph of 512 to 768 words so it can be appended to a student model prompt.
 
 Requirements:
-- Compress the [Previous Solution] and [GPT Feedback on Previous Solution] together in one pass.
+- Aggressively compress the [Previous Solution] and [GPT Feedback on Previous Solution] together in one pass.
+- Compress them into one concise paragraph of 512 to 768 words.
 - Return a single reroll_context string that still contains both section headers, in this order:
   [Previous Solution]
   [GPT Feedback on Previous Solution]
@@ -129,7 +131,7 @@ Requirements:
 - If the previous solution is wrong, vague, repetitive, disorganized, or overly verbose, preserve that quality and meaning.
 - Preserve all important mistakes, contradictions, final answers, and reasoning choices from the previous solution.
 - Preserve actionable GPT feedback, low rubric scores, and revision suggestions.
-- The entire returned reroll_context must be at most {target_tokens} student-tokenizer tokens.
+- The entire returned reroll_context must be one concise paragraph of 512 to 768 words and at most {target_tokens} student-tokenizer tokens.
 
 [Reroll Context To Compress: Previous Solution + GPT Feedback]
 {context}
@@ -283,8 +285,8 @@ def _score_schema() -> dict[str, Any]:
                     "Mathematical Rigor": _rubric_score_schema(0.25),
                     "Answer Correctness and Verifiability": _rubric_score_schema(0.20),
                     "Expression Fluency": _rubric_score_schema(0.15),
-                    "Expression Conciseness": _rubric_score_schema(0.15),
-                    "Solution Reasonableness": _rubric_score_schema(0.25),
+                    "Expression Conciseness": _rubric_score_schema(0.10),
+                    "Solution Reasonableness": _rubric_score_schema(0.30),
                 },
                 "required": list(RUBRIC_NAMES),
                 "additionalProperties": False,
