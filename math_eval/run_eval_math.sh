@@ -162,9 +162,26 @@ else
     echo "[skip] dataset download because SKIP_DOWNLOAD=1"
 fi
 
-MODEL="${MODEL:-qwen3_1.7b_gopd_step110_new}"
-MODEL_PATH="${MODEL_PATH:-/G-OPD-checkpoints/Qwen3-1.7B-Standard-OPD-DAPO-Math-17K/global_step_110/actor/merged_hf_new}"
+MODEL="${MODEL:-qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_rubric_40_save_step_50}"
+FSDP_CKPT_DIR="${FSDP_CKPT_DIR:-/G-OPD-checkpoints/qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_rubric_40_save_step_50/global_step_110/actor}"
+MODEL_PATH="${MODEL_PATH:-$FSDP_CKPT_DIR/merged_hf}"
 MODEL_NAME="${MODEL_NAME:-${MODEL}_8k_n8}"
+
+if ! ls "$MODEL_PATH"/model*.safetensors "$MODEL_PATH"/pytorch_model*.bin >/dev/null 2>&1; then
+    if [ ! -f "$FSDP_CKPT_DIR/model_world_size_4_rank_0.pt" ]; then
+        echo "ERROR: missing FSDP checkpoint shards: $FSDP_CKPT_DIR"
+        exit 1
+    fi
+
+    echo "[merge] $FSDP_CKPT_DIR -> $MODEL_PATH"
+    (
+        cd "$PROJECT_ROOT/verl"
+        python3 -m verl.model_merger merge \
+            --backend fsdp \
+            --local_dir "$FSDP_CKPT_DIR" \
+            --target_dir "$MODEL_PATH"
+    )
+fi
 
 if [ ! -f "$MODEL_PATH/config.json" ]; then
     echo "ERROR: MODEL_PATH is not a Hugging Face model directory: $MODEL_PATH"
@@ -231,3 +248,5 @@ if [ "${SHOW_SUMMARY:-1}" = "1" ]; then
         --output-dir "$OUTPUT_DIR" \
         --models "$MODEL_NAME"
 fi
+
+
