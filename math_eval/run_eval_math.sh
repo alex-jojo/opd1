@@ -16,7 +16,7 @@ else
 fi
 
 DATA_DIR="$PROJECT_ROOT/data"
-OUTPUT_DIR="$MATH_EVAL_DIR/eval_outputs"
+OUTPUT_DIR="${OUTPUT_DIR:-$MATH_EVAL_DIR/eval_outputs}"
 
 cd "$PROJECT_ROOT"
 
@@ -162,14 +162,73 @@ else
     echo "[skip] dataset download because SKIP_DOWNLOAD=1"
 fi
 
-MODEL="${MODEL:-qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_rubric_40_save_step_50}"
-FSDP_CKPT_DIR="${FSDP_CKPT_DIR:-/G-OPD-checkpoints/qwen3_1.7b_non_thinking_teacher_qwen3_4b_non_thinking_rl_math_rubric_40_save_step_50/global_step_110/actor}"
+G_OPD_EXPERIMENT_NAME="${G_OPD_EXPERIMENT_NAME:-146_qwen3_1.7b_teacher_qwen3_4b_vanilla_opd}"
+G_OPD_SAVE_FREQ="${G_OPD_SAVE_FREQ:-50}"
+G_OPD_DEFAULT_CKPT_DIR="/G-OPD-checkpoints/${G_OPD_EXPERIMENT_NAME}_save_step_${G_OPD_SAVE_FREQ}"
+G_OPD_CKPT_DIR="${G_OPD_CKPT_DIR:-$G_OPD_DEFAULT_CKPT_DIR}"
+
+if [ -z "${FSDP_CKPT_DIR:-}" ]; then
+    LATEST_STEP_DIR="$(
+        find "$G_OPD_CKPT_DIR" -maxdepth 3 -type f -path '*/actor/model_world_size_*_rank_0.pt' 2>/dev/null \
+            | sed 's#/actor/model_world_size_[^/]*_rank_0\.pt$##' \
+            | awk -F'global_step_' '/global_step_[0-9]+$/ {print $2 "\t" $0}' \
+            | sort -n \
+            | tail -1 \
+            | cut -f2-
+    )"
+
+    if [ -z "$LATEST_STEP_DIR" ]; then
+        echo "ERROR: no G-OPD actor checkpoints found under: $G_OPD_CKPT_DIR"
+        echo "Expected files like: $G_OPD_CKPT_DIR/global_step_<N>/actor/model_world_size_*_rank_0.pt"
+        exit 1
+    fi
+
+    FSDP_CKPT_DIR="$LATEST_STEP_DIR/actor"
+fi
+
+CKPT_STEP="$(basename "$(dirname "$FSDP_CKPT_DIR")")"
+MODEL="${MODEL:-$(basename "$G_OPD_CKPT_DIR")_${CKPT_STEP}}"
 MODEL_PATH="${MODEL_PATH:-$FSDP_CKPT_DIR/merged_hf}"
 MODEL_NAME="${MODEL_NAME:-${MODEL}_8k_n8}"
 
-if ! ls "$MODEL_PATH"/model*.safetensors "$MODEL_PATH"/pytorch_model*.bin >/dev/null 2>&1; then
-    if [ ! -f "$FSDP_CKPT_DIR/model_world_size_4_rank_0.pt" ]; then
-        echo "ERROR: missing FSDP checkpoint shards: $FSDP_CKPT_DIR"
+find_merged_weight() {
+    find "$MODEL_PATH" -maxdepth 1 -type f \
+        \( -name 'model*.safetensors' -o -name 'pytorch_model*.bin' \) \
+        -print -quit 2>/dev/null || true
+}
+
+MERGED_WEIGHT="$(find_merged_weight)"
+if [ -z "$MERGED_WEIGHT" ] || [ ! -f "$MODEL_PATH/config.json" ] || [ ! -f "$MODEL_PATH/tokenizer_config.json" ]; then
+    if [ ! -f "$FSDP_CKPT_DIR/fsdp_config.json" ]; then
+        echo "ERROR: FSDP checkpoint is not ready: $FSDP_CKPT_DIR"
+        echo "Expected fsdp_config.json and all model_world_size_<N>_rank_<R>.pt shards."
+        exit 1
+    fi
+
+    FSDP_WORLD_SIZE="$(python3 - "$FSDP_CKPT_DIR/fsdp_config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    world_size = json.load(f).get("world_size")
+
+if not isinstance(world_size, int) or world_size <= 0:
+    raise SystemExit(f"invalid world_size in {sys.argv[1]}: {world_size!r}")
+
+print(world_size)
+PY
+)"
+
+    MISSING_SHARDS=0
+    for ((rank = 0; rank < FSDP_WORLD_SIZE; rank++)); do
+        shard="$FSDP_CKPT_DIR/model_world_size_${FSDP_WORLD_SIZE}_rank_${rank}.pt"
+        if [ ! -f "$shard" ]; then
+            echo "ERROR: missing FSDP checkpoint shard: $shard"
+            MISSING_SHARDS=1
+        fi
+    done
+    if [ "$MISSING_SHARDS" = "1" ]; then
+        echo "Checkpoint may still be saving; retry after global_step checkpoint creation finishes."
         exit 1
     fi
 
@@ -183,7 +242,8 @@ if ! ls "$MODEL_PATH"/model*.safetensors "$MODEL_PATH"/pytorch_model*.bin >/dev/
     )
 fi
 
-if [ ! -f "$MODEL_PATH/config.json" ]; then
+MERGED_WEIGHT="$(find_merged_weight)"
+if [ -z "$MERGED_WEIGHT" ] || [ ! -f "$MODEL_PATH/config.json" ] || [ ! -f "$MODEL_PATH/tokenizer_config.json" ]; then
     echo "ERROR: MODEL_PATH is not a Hugging Face model directory: $MODEL_PATH"
     exit 1
 fi
@@ -211,6 +271,7 @@ run_eval() {
     CUDA_VISIBLE_DEVICES="$gpu_devices" python3 "$MATH_EVAL_DIR/eval_math.py" \
         --input_file "$DATA_DIR/$dataset/test.jsonl" \
         --model_path "$MODEL_PATH" \
+        --model_name "$MODEL_NAME" \
         --output_file "$OUTPUT_DIR/$dataset/${MODEL_NAME}.jsonl" \
         --max_tokens 8192 \
         --temperature 1.0 \
@@ -248,5 +309,3 @@ if [ "${SHOW_SUMMARY:-1}" = "1" ]; then
         --output-dir "$OUTPUT_DIR" \
         --models "$MODEL_NAME"
 fi
-
-

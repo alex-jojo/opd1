@@ -130,7 +130,14 @@ def normalize_final_answer(final_answer: str) -> str:
     Returns:
         Normalized answer string
     """
-    final_answer = final_answer.split("=")[-1]
+    final_answer = final_answer.split("=")[-1].strip()
+
+    display_math_match = re.fullmatch(r"\$\$(.*?)\$\$", final_answer, flags=re.DOTALL)
+    if display_math_match:
+        final_answer = display_math_match.group(1).strip()
+    inline_math_match = re.fullmatch(r"\$(.*?)\$", final_answer, flags=re.DOTALL)
+    if inline_math_match:
+        final_answer = inline_math_match.group(1).strip()
 
     # Apply substitutions and removals
     for before, after in SUBSTITUTIONS:
@@ -162,6 +169,24 @@ def normalize_final_answer(final_answer: str) -> str:
     return final_answer.strip()
 
 
+def extract_final_answer(
+    solution_str: str,
+    answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)",
+) -> str:
+    boxed_answer = last_boxed_only_string(solution_str)
+    if boxed_answer is not None:
+        return remove_boxed(boxed_answer)
+
+    match = re.findall(answer_pattern, solution_str)
+    if not match:
+        return "[INVALID]"
+
+    for extracted_answer in reversed(match):
+        if normalize_final_answer(extracted_answer):
+            return extracted_answer
+    return match[-1]
+
+
 def is_correct_minerva(
     solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
 ) -> tuple[bool, str]:
@@ -177,8 +202,7 @@ def is_correct_minerva(
         Tuple of (is_correct, normalized_prediction)
     """
     # Extract answer from solution
-    match = re.findall(answer_pattern, solution_str)
-    extracted_answer = match[-1] if match else "[INVALID]"
+    extracted_answer = extract_final_answer(solution_str, answer_pattern)
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth

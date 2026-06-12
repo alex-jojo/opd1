@@ -1,0 +1,45 @@
+# EOPD baseline config.
+#
+# This config inherits verl's standard PPO trainer config and only adds the
+# isolated baseline switches. Runtime paths and batch sizes are set by the
+# example shell script or command-line overrides.
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+actor_rollout_ref:
+  ref:
+    topk_logits: 16
+  actor:
+    use_kl_loss: True
+    kl_loss_coef: 0
+    entropy_coeff: 0
+    policy_loss:
+      _target_: recipe.eopd_baseline.eopd_config.EOPDPolicyLossConfig
+      only_reverse_kl_advantages: True
+      lambda_vals: 1.0
+      multi_teacher_distill: False
+      eopd:
+        enable: True
+        topk: 16
+        entropy_threshold: 0.8
+        alpha: 1.0
+        entropy_renormalize_topk: True
+        debug:
+          enable: False
+          dir: null
+          max_samples: 1
+          max_tokens_per_sample: 16
+          rank0_only: True
+          print_to_console: True
+
+trainer:
+  project_name: on-policy-distillation
+  experiment_name: eopd_baseline
+  progress_debug: True
+  gpt_rollout_score:

@@ -9,20 +9,31 @@ from typing import Any
 
 
 RUBRIC_NAMES = (
+    "Problem Understanding and Constraint Use",
     "Mathematical Rigor",
     "Answer Correctness and Verifiability",
+    "Exploration and Exploitation",
+    "Solution Reasonableness",
     "Expression Fluency",
     "Expression Conciseness",
-    "Solution Reasonableness",
 )
+RUBRIC_WEIGHTS = {
+    "Problem Understanding and Constraint Use": 0.15,
+    "Mathematical Rigor": 0.15,
+    "Answer Correctness and Verifiability": 0.20,
+    "Exploration and Exploitation": 0.20,
+    "Solution Reasonableness": 0.125,
+    "Expression Fluency": 0.10,
+    "Expression Conciseness": 0.075,
+}
 
 TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 FALSE_VALUES = {"0", "false", "f", "no", "n", "off", ""}
 _LOG_LOCK = threading.Lock()
 
 EVALUATION_PROMPT_TEMPLATE = """You are a mathematical solution quality evaluation model. Your task is to score a given solution based on the provided [Problem], [Ground Truth Answer], and [Solution to Evaluate].
-Please note: the [Ground Truth Answer] contains only the final correct answer and does not include a reference solution or intermediate reasoning. Therefore, you should not require the evaluated solution to match any specific solution method. Instead, you should independently judge whether the mathematical reasoning is valid, whether the final answer is correct, and whether the explanation is clear and reasonable.
-Please score the solution strictly according to the following 5 rubrics. Each rubric should receive a numeric score from 1.0 to 4.0, allowing only 0.5-point increments:
+Please note: the [Ground Truth Answer] contains only the final correct answer and does not include a reference solution or intermediate reasoning. Therefore, you should not require the evaluated solution to match any specific solution method. Instead, you should independently judge whether the solution understands the problem, reasons in a mathematically meaningful way, explores useful directions when needed, reaches a correct or partially useful conclusion, and explains the process clearly.
+Please score the solution strictly according to the following 7 rubrics. Each rubric should receive a numeric score from 1.0 to 4.0, allowing only 0.5-point increments:
 4.0 points: Excellent performance, with almost no obvious issues.
 3.0 points: Generally good, with only minor flaws.
 2.0 points: Contains clear issues, but still has some reasonable content.
@@ -31,78 +42,120 @@ Use 0.5-point scores, such as 2.5 or 3.5, when the quality falls between two adj
 
 Scoring principles:
 Do not automatically give a high score just because the final answer is correct; the reasoning process must also be reasonable.
-Do not penalize a solution simply because it differs from common methods, as long as it is mathematically correct and reasonable.
+Do not automatically give a low score just because the final answer is wrong; meaningful setup, useful intermediate results, or relevant exploration should receive credit.
+Do not require a fully formal proof when the solution already shows correct and useful mathematical reasoning.
+Do not penalize a solution simply because it differs from common methods, as long as the method is mathematically reasonable.
+Do not reward long, random, or repetitive exploration if it does not use the problem structure.
 Do not write a new complete solution; only evaluate the given solution itself.
-If the reasoning process is correct but the final answer is wrong, lower the score for "Answer Correctness and Verifiability", and adjust other scores appropriately based on the source of the error.
-If the final answer is correct but the reasoning is wrong, severely incomplete, or appears to rely on guessing, lower the scores for "Mathematical Rigor" and "Solution Reasonableness".
-If the solution contains multiple mutually contradictory answers, lower the score for "Answer Correctness and Verifiability".
-If the solution contains partially correct key intermediate expressions, transformations, formulas, computations, or reasoning steps that are relevant to the problem, give at least 2.0 for the applicable rubric(s), even if the solution is incomplete or has later mistakes.
-If the final percentage score is below 45, provide a concise revision suggestion. If the final score is greater than or equal to 45, do not provide a revision suggestion.
-When writing the revision_suggestion, it should help guide and correct the model's reasoning process rather than directly revealing the correct final answer.
+If the final answer is correct but the reasoning is clearly wrong, guessed, or unsupported, lower the scores for Mathematical Rigor, Exploration and Exploitation, and Solution Reasonableness.
+If the final answer is wrong but the solution contains correct and relevant intermediate work, give partial credit in the applicable rubrics.
+If the solution contains multiple contradictory answers, lower the score for Answer Correctness and Verifiability.
 
-Rubric 1: Mathematical Rigor
-Weight: 25%
-Evaluate whether the mathematical reasoning in the solution is rigorous and reliable.
-Assign 1.0 only when there is no effective mathematical content, the content is completely impossible to evaluate, or the response is unrelated to the problem.
+Revision Suggestion Rules
+After assigning the rubric scores, estimate the final weighted percentage. If it would be below 50, revision_suggestion is mandatory and must be non-empty. If it would be at least 50, set revision_suggestion to an empty string "".
+The revision_suggestion should help the next attempt reason better, but it must not reveal the correct final answer or give a complete solution path.
+Write the revision_suggestion in 1 to 2 short sentences and no more than 256 characters.
+For a below-50 solution, never leave revision_suggestion blank; this field is used as supervision for a second rollout.
+When the solution already has a useful setup, equation, case split, intermediate result, or promising idea, the suggestion should guide the solver to continue from that useful part, check the weak step, and complete the reasoning more carefully.
+When the solution is mostly off-track, based on a wrong interpretation, or stuck in unhelpful computation, the suggestion should gently point toward a different broad direction that fits the problem structure, such as using constraints, trying cases, looking for an invariant, setting up an equation, drawing a diagram, bounding quantities, or checking special cases.
+When the solution has the right general method but loses accuracy near the end, the suggestion should focus on verifying the final computation, sign, condition, format, or answer extraction.
+The revision_suggestion should not mention rubric names, scores, weights, or evaluation policy.
+The revision_suggestion should not say "the correct answer is..." or include the ground truth answer.
+The revision_suggestion should not provide a hidden shortcut that directly determines the final answer.
+The revision_suggestion should not merely say "try again" or "be more rigorous"; it should name a concrete reasoning action.
+
+Rubric 1: Problem Understanding and Constraint Use
+Weight: 15%
+Evaluate whether the solution understands the problem and uses the important information in the problem statement.
 Scoring criteria:
-Whether the reasoning chain is valid, and whether each step follows naturally from the problem statement, definitions, theorems, or previous steps.
-Whether there are issues such as skipped steps, circular reasoning, unsupported intuition-based claims, or reasoning backward from the conclusion.
-Whether key conditions are fully used, such as integer constraints, positivity, ranges, uniqueness, extrema, divisibility, distinctness, and other restrictions.
-For problems requiring case analysis, whether all cases are covered and impossible cases are reasonably eliminated.
-If some key intermediate reasoning, equations, transformations, or case setup is mathematically valid and relevant, the score for this rubric should be at least 2.0. Give 1.0 only when the solution has no valid mathematical reasoning, is impossible to evaluate, or is unrelated to the problem.
+Whether the solution identifies the target quantity or conclusion.
+Whether it correctly introduces relevant variables, equations, diagrams, cases, or conditions.
+Whether it uses key constraints such as integer conditions, positivity, ranges, parity, divisibility, uniqueness, extrema, distinctness, or geometric relationships.
+Whether it avoids solving a different, simplified, or misread version of the problem.
+If the solution correctly sets up meaningful information from the problem, this rubric should usually receive at least 2.0 even if the later solution is incomplete.
 
-Rubric 2: Answer Correctness and Verifiability
+Rubric 2: Mathematical Rigor
+Weight: 15%
+Evaluate whether the mathematical steps in the solution are valid and reliable.
+Scoring criteria:
+Whether algebraic transformations, equations, inequalities, counting arguments, case analysis, or geometric claims follow from previous steps.
+Whether the solution avoids unsupported jumps, circular reasoning, contradictions, or invalid assumptions.
+Whether important claims are justified enough to be believable.
+Whether errors are small and local, or whether they break the whole solution.
+This rubric should focus on the correctness of the reasoning that is present, not on demanding a fully formal proof.
+
+Rubric 3: Answer Correctness and Verifiability
 Weight: 20%
 Evaluate whether the final answer is correct, clear, and easy to verify.
-Assign 1.0 only when there is no effective mathematical content, the content is completely impossible to evaluate, or the response is unrelated to the problem.
 Scoring criteria:
-Whether the final answer matches the ground truth answer, especially regarding signs, integer form, modular results, or any special output format required by the problem.
-Whether the final answer is clear and unique, without multiple mutually contradictory answers.
-Whether the answer follows naturally from the preceding derivation, rather than being suddenly stated or guessed.
-Whether the final answer is expressed clearly, avoiding ambiguity, redundancy, or forms that are difficult to parse.
-If the final answer is wrong but the solution includes a clearly correct, relevant, and verifiable intermediate result, or the mistake is only a small final arithmetic, sign, simplification, or formatting error, the score for this rubric should be at least 2.0. Give 1.0 only when there is no meaningful answer to verify, the stated answer is unrelated to the problem, or the response is impossible to evaluate.
+Whether the final answer matches the ground truth answer, including signs, integer form, modular result, units, or required format.
+Whether the final answer is stated clearly and uniquely.
+Whether the answer follows from the preceding reasoning rather than appearing suddenly or being guessed.
+Whether a wrong answer is caused by a small arithmetic, sign, simplification, or formatting error, or by a deeper reasoning failure.
+If the final answer is wrong but the solution includes correct, relevant, and verifiable intermediate results, the score for this rubric should not automatically be 1.0.
 
-Rubric 3: Expression Fluency
-Weight: 15%
-Evaluate whether the solution process is natural, coherent, and easy to read.
+Rubric 4: Exploration and Exploitation
+Weight: 20%
+Evaluate whether the solution chooses a reasonable amount of searching or direct solving based on how difficult the problem appears to be for the model, as reflected by the model's own output.
 Scoring criteria:
-Whether the solution proceeds in a natural order, such as understanding the problem, establishing relationships, deriving or computing results, and reaching a conclusion.
-Whether variables, symbols, and intermediate conclusions are consistent throughout, avoiding cases where the same symbol refers to different objects.
-Whether sentences, formulas, and paragraphs connect smoothly, allowing the reader to follow the solution.
-Whether the solution avoids disorganized trial-and-error, repeated revisions, sudden shifts in direction, or unexplained formula dumping.
-
-Rubric 4: Expression Conciseness
-Weight: 10%
-Evaluate whether the solution is concise and effective, without obvious redundancy.
-Scoring criteria:
-Whether the solution includes only necessary reasoning and avoids irrelevant background information, small talk, or excessive explanation.
-Whether it avoids repeating the same conclusion, repeating computations, or including clearly redundant intermediate steps.
-Whether it completes the proof or computation through a relatively short path while maintaining rigor.
-For simple problems, whether it avoids unnecessary overcomplication; for difficult problems, whether it avoids using large amounts of ineffective enumeration to obscure the core idea.
+For difficult problems, whether the solution tries relevant approaches such as examples, cases, transformations, equations, lemmas, bounds, or structural observations.
+Whether the exploration is connected to the actual problem rather than random guessing or unrelated computation.
+Whether the solution notices useful intermediate results and tries to build on them.
+Whether the solution changes direction when an approach becomes unhelpful.
+For easier problems, whether the solution avoids unnecessary wandering and uses a direct path.
+Whether the solution can turn progress into a conclusion when enough information has been found.
+High scores should go to solutions that either explore difficult problems in useful ways or solve easier problems efficiently. Low scores should go to solutions that give up too early, guess blindly, wander without purpose, or fail to use progress that it already made.
 
 Rubric 5: Solution Reasonableness
-Weight: 30%
-Evaluate whether the chosen solution method is appropriate for the problem, whether it captures the key structure, and whether it is relatively strong among possible solution methods.
+Weight: 12.5%
+Evaluate whether the overall method is appropriate for the problem.
 Scoring criteria:
-Whether the chosen method fits the problem type, such as algebraic manipulation, case analysis, construction, counting, number-theoretic reasoning, geometric relationships, and so on.
-Whether the solution captures the core structure of the problem, rather than relying on blind enumeration, guessing, or inefficient computation.
-Whether it uses a relatively natural, stable, and less error-prone solution path; if the method is clearly roundabout or unnecessarily complicated, lower the score.
-Whether the solution reflects reusable mathematical thinking, rather than an accidental operation tailored only to a single answer.
+Whether the chosen method fits the problem type, such as algebra, number theory, counting, construction, case analysis, inequalities, or geometry.
+Whether the solution focuses on the core structure of the problem rather than only surface features.
+Whether the method is reasonably efficient for the problem difficulty.
+Whether brute force, enumeration, or computation is used only when it is reasonable.
+Whether the solution reflects reusable mathematical thinking rather than accidental manipulation.
+
+Rubric 6: Expression Fluency
+Weight: 10%
+Evaluate whether the solution is coherent and easy to follow.
+Scoring criteria:
+Whether the solution proceeds in a natural order.
+Whether variables, symbols, and intermediate conclusions are used consistently.
+Whether formulas and sentences connect smoothly.
+Whether the reader can understand why the solution moves from one step to the next.
+Whether the solution avoids disorganized restarts, sudden unexplained shifts, or formula dumping.
+
+Rubric 7: Expression Conciseness
+Weight: 7.5%
+Evaluate whether the solution is concise and avoids unnecessary content.
+Scoring criteria:
+Whether the solution avoids irrelevant background, small talk, or repeated statements.
+Whether it avoids repeating the same computation or conclusion.
+Whether it uses a reasonably short path while keeping enough explanation.
+Whether it avoids excessive enumeration when a clearer structure is available.
+For difficult problems, do not penalize necessary exploration, but penalize repetitive or unhelpful wandering.
 
 Total Score Calculation
 Each rubric receives a numeric score from 1.0 to 4.0 in 0.5-point increments.
 The weighted score is calculated as follows:
+
 Weighted Score =
-Mathematical Rigor * 0.25
-Answer Correctness and Verifiability * 0.20
-Expression Fluency * 0.15
-Expression Conciseness * 0.10
-Solution Reasonableness * 0.30
+Problem Understanding and Constraint Use * 0.15
++ Mathematical Rigor * 0.15
++ Answer Correctness and Verifiability * 0.20
++ Exploration and Exploitation * 0.20
++ Solution Reasonableness * 0.125
++ Expression Fluency * 0.10
++ Expression Conciseness * 0.075
+
 The final weighted score ranges from 1.0 to 4.0.
 The percentage score is:
 Final Score = Weighted Score / 4 * 100
-If final_score_100 < 45, provide a concise revision suggestion in the revision_suggestion field.
-If final_score_100 >= 45, set the revision_suggestion field to an empty string "".
+
+Do not output weighted_score_1_to_4 or final_score_100. The local evaluator code will compute both fields from rubric_scores.
+If the locally computed final score would be below 50, provide a concise revision suggestion in the revision_suggestion field. It must be non-empty and no more than 256 characters.
+If the locally computed final score would be at least 50, set the revision_suggestion field to an empty string "".
 
 Input Format
 [Problem]
@@ -115,29 +168,36 @@ Input Format
 {solution}
 
 Output Format
+Please strictly output in the requested JSON schema and do not output any extra text.
+The JSON must contain only rubric_scores and revision_suggestion at the top level. Do not include weighted_score_1_to_4, final_score_100, or overall_comment."""
+
+REVISION_SUGGESTION_PROMPT_TEMPLATE = """You are writing a concise hint for a second attempt at a math problem.
+The previous evaluator scored the solution below 50/100 but did not provide a usable hint. Produce only one revision_suggestion.
+
+Rules:
+The revision_suggestion must be non-empty and no more than 256 characters.
+Write 1 to 2 short sentences.
+Do not reveal the correct final answer or include the ground truth answer.
+Do not give a complete solution path.
+Do not mention rubric names, scores, weights, or evaluation policy.
+Do not merely say "try again" or "be more rigorous"; name a concrete reasoning action.
+If the solution has useful partial work, guide the next attempt to continue from it and check the weak step.
+If the solution is off-track, point toward a broad problem-appropriate direction such as using constraints, cases, equations, invariants, bounds, or a diagram.
+
+[Problem]
+{problem}
+
+[Ground Truth Answer]
+{ground_truth}
+
+[Low-Scoring Solution]
+{solution}
+
+[Evaluator Notes]
+{rubric_feedback}
+
+Output Format
 Please strictly output in the requested JSON schema and do not output any extra text."""
-
-REROLL_CONTEXT_SUMMARY_PROMPT_TEMPLATE = """Aggressively compress the reroll context below into one concise paragraph of 512 to 768 words so it can be appended to a student model prompt.
-
-Requirements:
-- Aggressively compress the [Previous Solution] and [GPT Feedback on Previous Solution] together in one pass.
-- Compress them into one concise paragraph of 512 to 768 words.
-- Return a single reroll_context string that still contains both section headers, in this order:
-  [Previous Solution]
-  [GPT Feedback on Previous Solution]
-- Do not include the problem statement or the final "solve again" instruction in reroll_context.
-- Do not solve the math problem again.
-- Do not improve, correct, or polish the previous solution beyond compression.
-- If the previous solution is wrong, vague, repetitive, disorganized, or overly verbose, preserve that quality and meaning.
-- Preserve all important mistakes, contradictions, final answers, and reasoning choices from the previous solution.
-- Preserve actionable GPT feedback, low rubric scores, and revision suggestions.
-- The entire returned reroll_context must be one concise paragraph of 512 to 768 words and at most {target_tokens} student-tokenizer tokens.
-
-[Reroll Context To Compress: Previous Solution + GPT Feedback]
-{context}
-
-Return only JSON matching the schema."""
-
 
 def _get(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
@@ -275,6 +335,70 @@ def _rubric_score_schema(weight: float) -> dict[str, Any]:
     }
 
 
+def _weighted_score_from_rubrics(rubric_scores: dict[str, Any]) -> float:
+    weighted_score = 0.0
+    for name in RUBRIC_NAMES:
+        weighted_score += float(rubric_scores[name]["score"]) * RUBRIC_WEIGHTS[name]
+    return round(max(1.0, min(4.0, weighted_score)), 6)
+
+
+def _score_100_from_weighted_score(weighted_score: float) -> float:
+    return round(max(25.0, min(100.0, weighted_score / 4.0 * 100.0)), 6)
+
+
+def _compute_scores_from_rubrics(rubric_scores: dict[str, Any]) -> tuple[float, float]:
+    weighted_score = _weighted_score_from_rubrics(rubric_scores)
+    return weighted_score, _score_100_from_weighted_score(weighted_score)
+
+
+def _fallback_revision_suggestion(rubric_scores: dict[str, Any]) -> str:
+    fallback_by_rubric = {
+        "Problem Understanding and Constraint Use": (
+            "Re-read the problem, identify the target and key constraints, then set up variables, cases, or equations that directly use them."
+        ),
+        "Mathematical Rigor": (
+            "Check each inference for justification, especially the step where the argument changes direction or assumes an unstated condition."
+        ),
+        "Answer Correctness and Verifiability": (
+            "Verify the final computation and substitute the result back into the original conditions before extracting the final answer."
+        ),
+        "Exploration and Exploitation": (
+            "Use the most promising partial result to continue systematically; if it stalls, try cases, bounds, or an invariant tied to the constraints."
+        ),
+        "Solution Reasonableness": (
+            "Pause at the main conclusion and test whether it is compatible with the problem conditions, edge cases, and expected size or sign."
+        ),
+        "Expression Fluency": (
+            "Rewrite the reasoning in a clear sequence of claims and checks so the next step follows from the previous one."
+        ),
+        "Expression Conciseness": (
+            "Remove unrelated exploration and focus on the shortest chain from the setup to a verifiable final answer."
+        ),
+    }
+    weakest_name = "Problem Understanding and Constraint Use"
+    weakest_score = float("inf")
+    for name in RUBRIC_NAMES:
+        try:
+            score = float(rubric_scores[name]["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if score < weakest_score:
+            weakest_score = score
+            weakest_name = name
+    return fallback_by_rubric[weakest_name][:256]
+
+
+def _revision_suggestion_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "revision_suggestion": {"type": "string"},
+        },
+        "required": ["revision_suggestion"],
+        "additionalProperties": False,
+    }
+
+
 def _score_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -282,38 +406,17 @@ def _score_schema() -> dict[str, Any]:
             "rubric_scores": {
                 "type": "object",
                 "properties": {
-                    "Mathematical Rigor": _rubric_score_schema(0.25),
-                    "Answer Correctness and Verifiability": _rubric_score_schema(0.20),
-                    "Expression Fluency": _rubric_score_schema(0.15),
-                    "Expression Conciseness": _rubric_score_schema(0.10),
-                    "Solution Reasonableness": _rubric_score_schema(0.30),
+                    name: _rubric_score_schema(RUBRIC_WEIGHTS[name]) for name in RUBRIC_NAMES
                 },
                 "required": list(RUBRIC_NAMES),
                 "additionalProperties": False,
             },
-            "weighted_score_1_to_4": {"type": "number", "minimum": 1, "maximum": 4},
-            "final_score_100": {"type": "number", "minimum": 25, "maximum": 100},
-            "overall_comment": {"type": "string"},
             "revision_suggestion": {"type": "string"},
         },
         "required": [
             "rubric_scores",
-            "weighted_score_1_to_4",
-            "final_score_100",
-            "overall_comment",
             "revision_suggestion",
         ],
-        "additionalProperties": False,
-    }
-
-
-def _reroll_context_summary_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "reroll_context": {"type": "string"},
-        },
-        "required": ["reroll_context"],
         "additionalProperties": False,
     }
 
@@ -338,6 +441,117 @@ def _add_reasoning_effort(payload: dict[str, Any], model: str, reasoning_effort:
         payload["reasoning"] = {"effort": reasoning_effort}
 
 
+def _normalize_revision_suggestion(value: Any) -> str:
+    return str(value or "").strip()[:256].strip()
+
+
+def _rubric_feedback_for_hint(rubric_scores: dict[str, Any]) -> str:
+    feedback: list[tuple[float, str]] = []
+    for name in RUBRIC_NAMES:
+        rubric = rubric_scores.get(name, {}) if isinstance(rubric_scores, dict) else {}
+        try:
+            score = float(rubric.get("score"))
+        except (TypeError, ValueError):
+            continue
+        reason = str(rubric.get("reason", "")).replace("\n", " ").strip()
+        if reason:
+            feedback.append((score, reason[:240]))
+    feedback.sort(key=lambda item: item[0])
+    if not feedback:
+        return "The evaluator found the solution below 50/100 but did not provide detailed notes."
+    return "\n".join(f"- score {score:g}: {reason}" for score, reason in feedback[:3])
+
+
+def _suggest_revision_one(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    problem: str,
+    response: str,
+    ground_truth: str,
+    rubric_scores: dict[str, Any],
+    timeout: float,
+    retries: int,
+    max_output_tokens: int,
+    reasoning_effort: str | None,
+    request_idx: int,
+    request_count: int,
+    verbose: bool,
+) -> tuple[str, str]:
+    user_prompt = REVISION_SUGGESTION_PROMPT_TEMPLATE.format(
+        problem=problem,
+        ground_truth=ground_truth,
+        solution=response,
+        rubric_feedback=_rubric_feedback_for_hint(rubric_scores),
+    )
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "developer",
+                "content": (
+                    "Write one concise revision suggestion for a low-scoring math solution. "
+                    "Return only JSON matching the schema."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "math_solution_revision_suggestion",
+                "strict": True,
+                "schema": _revision_suggestion_schema(),
+            }
+        },
+        "max_output_tokens": max_output_tokens,
+    }
+    _add_reasoning_effort(payload, model, reasoning_effort)
+
+    last_error = ""
+    total_attempts = retries + 1
+    for attempt in range(total_attempts):
+        attempt_start = time.time()
+        if verbose:
+            _debug_print(
+                f"hint request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} start "
+                f"model={model} timeout={timeout:g}s max_output_tokens={max_output_tokens}"
+            )
+        try:
+            api_response = _post_json(api_url, api_key, payload, timeout)
+            text = _extract_response_text(api_response)
+            parsed = json.loads(text)
+            revision_suggestion = _normalize_revision_suggestion(parsed.get("revision_suggestion", ""))
+            if revision_suggestion:
+                if verbose:
+                    _debug_print(
+                        f"hint request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} done "
+                        f"chars={len(revision_suggestion)} elapsed={time.time() - attempt_start:.1f}s"
+                    )
+                return revision_suggestion, ""
+            last_error = "empty revision_suggestion"
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = f"HTTP {exc.code}: {body}"
+        except Exception as exc:
+            last_error = str(exc)
+
+        if verbose:
+            status = "retry" if attempt < retries else "failed"
+            _debug_print(
+                f"hint request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} {status} "
+                f"elapsed={time.time() - attempt_start:.1f}s error={_format_error(last_error)}"
+            )
+        if attempt < retries:
+            sleep_seconds = min(2**attempt, 8)
+            if verbose:
+                _debug_print(f"hint request {request_idx}/{request_count} sleep_before_retry={sleep_seconds}s")
+            time.sleep(sleep_seconds)
+
+    return "", last_error
+
+
 def _score_one(
     *,
     api_url: str,
@@ -349,6 +563,8 @@ def _score_one(
     timeout: float,
     retries: int,
     max_output_tokens: int,
+    hint_retries: int,
+    hint_max_output_tokens: int,
     reasoning_effort: str | None,
     request_idx: int,
     request_count: int,
@@ -397,19 +613,55 @@ def _score_one(
             api_response = _post_json(api_url, api_key, payload, timeout)
             text = _extract_response_text(api_response)
             parsed = json.loads(text)
-            score_100 = max(0.0, min(100.0, float(parsed["final_score_100"])))
+            rubric_scores = parsed["rubric_scores"]
+            weighted_score, score_100 = _compute_scores_from_rubrics(rubric_scores)
             if verbose:
                 _debug_print(
                     f"request {request_idx}/{request_count} attempt {attempt + 1}/{total_attempts} done "
                     f"score_100={score_100:.1f} elapsed={time.time() - attempt_start:.1f}s"
                 )
+            revision_suggestion = _normalize_revision_suggestion(parsed.get("revision_suggestion", ""))
+            revision_suggestion_source = "gpt" if revision_suggestion else ""
+            if score_100 >= 50.0:
+                revision_suggestion = ""
+                revision_suggestion_source = ""
+            else:
+                if not revision_suggestion:
+                    revision_suggestion, hint_error = _suggest_revision_one(
+                        api_url=api_url,
+                        api_key=api_key,
+                        model=model,
+                        problem=problem,
+                        response=response,
+                        ground_truth=ground_truth,
+                        rubric_scores=rubric_scores,
+                        timeout=timeout,
+                        retries=hint_retries,
+                        max_output_tokens=hint_max_output_tokens,
+                        reasoning_effort=reasoning_effort,
+                        request_idx=request_idx,
+                        request_count=request_count,
+                        verbose=verbose,
+                    )
+                    if revision_suggestion:
+                        revision_suggestion_source = "gpt_hint_retry"
+                    else:
+                        revision_suggestion = _fallback_revision_suggestion(rubric_scores)
+                        revision_suggestion_source = "local_fallback"
+                        if verbose:
+                            _debug_print(
+                                f"hint request {request_idx}/{request_count} local_fallback "
+                                f"error={_format_error(hint_error)}"
+                            )
+
             return {
                 "score": score_100 / 100.0,
                 "score_100": score_100,
-                "weighted_score_1_to_4": float(parsed["weighted_score_1_to_4"]),
-                "rubric_scores": parsed["rubric_scores"],
-                "reason": str(parsed.get("overall_comment", "")),
-                "revision_suggestion": str(parsed.get("revision_suggestion", "")),
+                "weighted_score_1_to_4": weighted_score,
+                "rubric_scores": rubric_scores,
+                "reason": "",
+                "revision_suggestion": revision_suggestion,
+                "revision_suggestion_source": revision_suggestion_source,
                 "error": "",
             }
         except urllib.error.HTTPError as exc:
@@ -437,6 +689,7 @@ def _score_one(
         "rubric_scores": None,
         "reason": "",
         "revision_suggestion": "",
+        "revision_suggestion_source": "",
         "error": last_error,
     }
 
@@ -456,6 +709,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
     max_prompt_tokens = int(_get(config, "max_prompt_chars", 2048))
     max_response_tokens = int(_get(config, "max_response_chars", 4096))
     max_output_tokens = int(_get(config, "max_output_tokens", 1024))
+    hint_retries = max(0, int(_get(config, "hint_retries", 0)))
+    hint_max_output_tokens = int(_get(config, "hint_max_output_tokens", 256))
     verbose = _to_bool(_get(config, "verbose", os.environ.get("GPT_ROLLOUT_SCORE_VERBOSE", "0")))
 
     prompt_ids = batch.batch["prompts"]
@@ -469,6 +724,7 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
         _debug_print(
             f"batch start requests={batch_size} max_workers={worker_count} model={model} "
             f"timeout={timeout:g}s retries={retries} max_output_tokens={max_output_tokens} "
+            f"hint_retries={hint_retries} hint_max_output_tokens={hint_max_output_tokens} "
             f"max_prompt_tokens={max_prompt_tokens} max_response_tokens={max_response_tokens} "
             f"reasoning_effort={_optional_str(reasoning_effort) or 'default'} api_url={api_url}"
         )
@@ -503,6 +759,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
                 "timeout": timeout,
                 "retries": retries,
                 "max_output_tokens": max_output_tokens,
+                "hint_retries": hint_retries,
+                "hint_max_output_tokens": hint_max_output_tokens,
                 "reasoning_effort": reasoning_effort,
                 "request_idx": i + 1,
                 "request_count": batch_size,
@@ -525,6 +783,7 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
                     "rubric_scores": None,
                     "reason": "",
                     "revision_suggestion": "",
+                    "revision_suggestion_source": "",
                     "error": str(exc),
                 }
             results[idx] = result
@@ -553,6 +812,7 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
             "rubric_scores": None,
             "reason": "",
             "revision_suggestion": "",
+            "revision_suggestion_source": "",
             "error": "missing GPT rollout scoring result",
         }
         for result in results
@@ -569,98 +829,7 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
         "rubric_scores": [result["rubric_scores"] for result in results],
         "reasons": [result["reason"] for result in results],
         "revision_suggestions": [result["revision_suggestion"] for result in results],
+        "revision_suggestion_sources": [result["revision_suggestion_source"] for result in results],
         "errors": [result["error"] for result in results],
         "models": [model for _ in results],
-    }
-
-
-def summarize_reroll_context_with_gpt(
-    *,
-    context: str,
-    target_tokens: int,
-    config: Any,
-    request_idx: int,
-    verbose: bool = False,
-) -> dict[str, Any]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required when reroll context summarization is enabled")
-
-    base_url = _get(config, "base_url", None) or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    api_url = base_url.rstrip("/") + "/responses"
-    model = _get(config, "reroll_summary_model", None) or _get(config, "model", "chat-latest") or "chat-latest"
-    reasoning_effort = _get(config, "reasoning_effort", os.environ.get("GPT_ROLLOUT_SCORE_REASONING_EFFORT", None))
-    timeout = float(_get(config, "timeout", 60))
-    retries = int(_get(config, "retries", 2))
-    max_output_tokens = int(_get(config, "reroll_summary_max_output_tokens", 1024))
-    user_prompt = REROLL_CONTEXT_SUMMARY_PROMPT_TEMPLATE.format(
-        target_tokens=target_tokens,
-        context=context,
-    )
-    payload = {
-        "model": model,
-        "input": [
-            {
-                "role": "developer",
-                "content": (
-                    "Compress reroll context for a math training pipeline. Preserve the previous solution's "
-                    "meaning, quality, flaws, and the GPT feedback. Return only JSON matching the schema."
-                ),
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "reroll_context_summary",
-                "strict": True,
-                "schema": _reroll_context_summary_schema(),
-            }
-        },
-        "max_output_tokens": max_output_tokens,
-    }
-    _add_reasoning_effort(payload, model, reasoning_effort)
-
-    last_error = ""
-    total_attempts = retries + 1
-    for attempt in range(total_attempts):
-        attempt_start = time.time()
-        if verbose:
-            _debug_print(
-                f"reroll_summary request_idx={request_idx} attempt={attempt + 1}/{total_attempts} "
-                f"model={model} context_chars={len(context)} target_tokens={target_tokens} "
-                f"max_output_tokens={max_output_tokens} reasoning_effort={_optional_str(reasoning_effort) or 'default'}"
-            )
-        try:
-            api_response = _post_json(api_url, api_key, payload, timeout)
-            text = _extract_response_text(api_response)
-            parsed = json.loads(text)
-            if verbose:
-                _debug_print(
-                    f"reroll_summary request_idx={request_idx} done elapsed={time.time() - attempt_start:.1f}s"
-                )
-            return {
-                "reroll_context": str(parsed["reroll_context"]),
-                "model": model,
-                "error": "",
-            }
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            last_error = f"HTTP {exc.code}: {body}"
-        except Exception as exc:
-            last_error = str(exc)
-
-        if verbose:
-            status = "retry" if attempt < retries else "failed"
-            _debug_print(
-                f"reroll_summary request_idx={request_idx} attempt={attempt + 1}/{total_attempts} {status} "
-                f"elapsed={time.time() - attempt_start:.1f}s error={_format_error(last_error)}"
-            )
-        if attempt < retries:
-            time.sleep(min(2**attempt, 8))
-
-    return {
-        "reroll_context": "",
-        "model": model,
-        "error": last_error,
     }

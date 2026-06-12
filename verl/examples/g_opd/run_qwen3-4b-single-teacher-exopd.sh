@@ -6,15 +6,13 @@ if [ "${G_OPD_SHELL_DEBUG:-0}" = "1" ]; then
 fi
 
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export WANDB_MODE=online
-export USED_MODEL="no_api"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export USED_MODEL="${USED_MODEL:-no_api}"
 export RAY_DISABLE_DOCKER_CPU_WARNING=1
 export HYDRA_FULL_ERROR=1
 export VERL_PRINT_CONFIG="${VERL_PRINT_CONFIG:-0}"
 export G_OPD_PROGRESS_DEBUG="${G_OPD_PROGRESS_DEBUG:-1}"
-export GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-1}"
-export WANDB_API_KEY='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'
 
 cd /workspace/opd1/verl
 
@@ -42,8 +40,15 @@ AIME26_JSONL="${AIME26_JSONL:-/workspace/G-OPD/data/aime26/test.jsonl}"
 AIME26_PARQUET="${AIME26_PARQUET:-/workspace/G-OPD/data/aime26/test_verl.parquet}"
 export AIME26_JSONL AIME26_PARQUET
 
-STUDENT_MODEL="/workspace/models/Qwen3-1.7B"
-TEACHER_MODEL="/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500"
+STUDENT_MODEL="${STUDENT_MODEL:-/workspace/models/Qwen3-4B}"
+TEACHER_MODEL="${TEACHER_MODEL:-/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500}"
+
+# Single-teacher ExOPD uses a fixed reference/base policy for reward extrapolation.
+# Default: student base reference, matching the paper's default strong-to-weak ExOPD.
+# For reward correction, set EXOPD_REFERENCE_MODEL to the teacher pre-RL base model.
+EXOPD_REFERENCE_MODEL="${EXOPD_REFERENCE_MODEL:-$STUDENT_MODEL}"
+EXOPD_LAMBDA="${EXOPD_LAMBDA:-1.25}"
+EXOPD_LR="${EXOPD_LR:-2e-6}"
 
 if [ ! -f "$AIME26_JSONL" ]; then
     mkdir -p "$(dirname "$AIME26_JSONL")"
@@ -82,7 +87,7 @@ download_hf_repo() {
 
 if [ ! -f "$STUDENT_MODEL/config.json" ]; then
     rm -rf "$STUDENT_MODEL"
-    download_hf_repo Qwen/Qwen3-1.7B "$STUDENT_MODEL"
+    download_hf_repo Qwen/Qwen3-4B "$STUDENT_MODEL"
 fi
 
 if [ ! -f "$TEACHER_MODEL/config.json" ]; then
@@ -90,15 +95,22 @@ if [ ! -f "$TEACHER_MODEL/config.json" ]; then
     download_hf_repo Keven16/Qwen3-4B-Non-Thinking-RL-Math-Step500 "$TEACHER_MODEL"
 fi
 
-python3 - <<PY
+if [ ! -f "$EXOPD_REFERENCE_MODEL/config.json" ]; then
+    echo "ERROR: EXOPD_REFERENCE_MODEL is not a Hugging Face model dir: $EXOPD_REFERENCE_MODEL"
+    echo "For default ExOPD, leave it as STUDENT_MODEL. For reward correction, point it to the teacher pre-RL base."
+    exit 1
+fi
+
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    python3 - <<'PY'
 import os
 import wandb
 
-key = os.environ.get("WANDB_API_KEY")
-if not key:
-    raise RuntimeError("WANDB_API_KEY is empty")
-wandb.login(key=key, relogin=True)
+wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
 PY
+else
+    echo "[warn] WANDB_API_KEY is empty. Set WANDB_MODE=offline or provide a key if wandb logging fails."
+fi
 
 python3 - <<'PY'
 import json
@@ -255,12 +267,14 @@ ray stop --force || true
 rm -rf /workspace/ray_tmp
 mkdir -p /workspace/ray_tmp
 
-G_OPD_EXPERIMENT_NAME="${G_OPD_EXPERIMENT_NAME:-146_qwen3_1.7b_teacher_qwen3_4b_vanilla_opd}"
+EXOPD_LAMBDA_TAG="${EXOPD_LAMBDA//./p}"
+G_OPD_EXPERIMENT_NAME="${G_OPD_EXPERIMENT_NAME:-146_qwen3_4b_teacher_qwen3_4b_single_teacher_exopd_lambda_${EXOPD_LAMBDA_TAG}}"
 G_OPD_SAVE_FREQ="${G_OPD_SAVE_FREQ:-50}"
 G_OPD_DEFAULT_CKPT_DIR="/G-OPD-checkpoints/${G_OPD_EXPERIMENT_NAME}_save_step_${G_OPD_SAVE_FREQ}"
 G_OPD_CKPT_DIR="${G_OPD_CKPT_DIR:-$G_OPD_DEFAULT_CKPT_DIR}"
 G_OPD_RESUME_MODE="${G_OPD_RESUME_MODE:-disable}"
 G_OPD_RESUME_FROM_PATH="${G_OPD_RESUME_FROM_PATH:-null}"
+TRAINER_LOGGER="${TRAINER_LOGGER:-[\"console\",\"wandb\"]}"
 
 case "$G_OPD_RESUME_MODE" in
     auto|disable|resume_path) ;;
@@ -270,52 +284,10 @@ case "$G_OPD_RESUME_MODE" in
         ;;
 esac
 
-GPT_ROLLOUT_SCORE_ENABLE="${GPT_ROLLOUT_SCORE_ENABLE:-False}"
-GPT_ROLLOUT_SCORE_MODEL="${GPT_ROLLOUT_SCORE_MODEL:-gpt-5.4-mini}"
-GPT_ROLLOUT_SCORE_REASONING_EFFORT="${GPT_ROLLOUT_SCORE_REASONING_EFFORT:-none}"
-GPT_ROLLOUT_SCORE_MAX_WORKERS="${GPT_ROLLOUT_SCORE_MAX_WORKERS:-128}"
-GPT_ROLLOUT_SCORE_TIMEOUT="${GPT_ROLLOUT_SCORE_TIMEOUT:-60}"
-GPT_ROLLOUT_SCORE_RETRIES="${GPT_ROLLOUT_SCORE_RETRIES:-2}"
-GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS="${GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS:-2048}"
-GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS="${GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS:-4096}"
-GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS:-768}"
-GPT_ROLLOUT_SCORE_HINT_RETRIES="${GPT_ROLLOUT_SCORE_HINT_RETRIES:-0}"
-GPT_ROLLOUT_SCORE_HINT_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_HINT_MAX_OUTPUT_TOKENS:-256}"
-GPT_ROLLOUT_SCORE_REROLL_MAX_OUTPUT_TOKENS="${GPT_ROLLOUT_SCORE_REROLL_MAX_OUTPUT_TOKENS:-512}"
-GPT_ROLLOUT_SCORE_MIN_SCORE_100="${GPT_ROLLOUT_SCORE_MIN_SCORE_100:-50}"
-GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS="${GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS:-1}"
-GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS:-256}"
-GPT_ROLLOUT_SCORE_ORIG_LOSS_WEIGHT="${GPT_ROLLOUT_SCORE_ORIG_LOSS_WEIGHT:-1.0}"
-GPT_ROLLOUT_SCORE_REROLL_HINT_LOSS_WEIGHT="${GPT_ROLLOUT_SCORE_REROLL_HINT_LOSS_WEIGHT:-0.5}"
-GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE:-False}"
-GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_SCORE="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_SCORE:-50}"
-GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_GAIN="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_GAIN:-10}"
-GPT_ROLLOUT_SCORE_REROLL_NOHINT_MAX_WEIGHT="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_MAX_WEIGHT:-0.5}"
-GPT_ROLLOUT_SCORE_REROLL_NOHINT_GAIN_NORM="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_GAIN_NORM:-50}"
-GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_ENABLE="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_ENABLE:-False}"
-GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_MODE="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_MODE:-rank_residual}"
-GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_COEF="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_COEF:-0.10}"
-GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_CLIP="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_CLIP:-0.20}"
-GPT_ROLLOUT_SCORE_RANK_GAP_DROP_ENABLE="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_ENABLE:-True}"
-GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD:-0.80}"
-GPT_ROLLOUT_SCORE_RANK_GAP_DROP_SCOPE="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_SCOPE:-all}"
-GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-1}"
-G_OPD_LOG_DIR="${G_OPD_LOG_DIR:-/workspace/G-OPD-logs/${G_OPD_EXPERIMENT_NAME}_save_step_${G_OPD_SAVE_FREQ}}"
-GPT_ROLLOUT_DATA_DIR="${GPT_ROLLOUT_DATA_DIR:-$G_OPD_LOG_DIR/rollout_data}"
-GPT_ROLLOUT_SCORE_CASE_STUDY_DIR="${GPT_ROLLOUT_SCORE_CASE_STUDY_DIR:-$G_OPD_LOG_DIR/gpt_low_score_cases}"
-GPT_ROLLOUT_SCORE_RANK_GAP_CASE_STUDY_DIR="${GPT_ROLLOUT_SCORE_RANK_GAP_CASE_STUDY_DIR:-$G_OPD_LOG_DIR/gpt_rank_gap_cases}"
-GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP="${GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP:-20}"
-GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100="${GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100:-$GPT_ROLLOUT_SCORE_MIN_SCORE_100}"
-GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS="${GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS:-True}"
-
-case "$GPT_ROLLOUT_SCORE_ENABLE" in
-    True|true|1|yes|YES)
-        if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "ERROR: OPENAI_API_KEY is required when GPT rollout scoring is enabled"
-            exit 1
-        fi
-        ;;
-esac
+echo "[exopd] student=$STUDENT_MODEL"
+echo "[exopd] teacher=$TEACHER_MODEL"
+echo "[exopd] reference=$EXOPD_REFERENCE_MODEL"
+echo "[exopd] lambda=$EXOPD_LAMBDA"
 
 python3 -m verl.trainer.main_ppo \
         algorithm.adv_estimator=grpo \
@@ -336,13 +308,15 @@ python3 -m verl.trainer.main_ppo \
         data.return_raw_chat=True \
         +data.apply_chat_template_kwargs.enable_thinking=False \
         actor_rollout_ref.model.path="$STUDENT_MODEL" \
+        +actor_rollout_ref.model.base_model_path="$EXOPD_REFERENCE_MODEL" \
         +actor_rollout_ref.ref.model.path="$TEACHER_MODEL" \
-        actor_rollout_ref.actor.optim.lr=2e-6 \
+        +actor_rollout_ref.ref.model.base_model_path="$EXOPD_REFERENCE_MODEL" \
+        actor_rollout_ref.actor.optim.lr="$EXOPD_LR" \
         data.filter_overlong_prompts_workers=4 \
         actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True \
-        actor_rollout_ref.actor.policy_loss.lambda_vals=1.0 \
+        actor_rollout_ref.actor.policy_loss.lambda_vals="$EXOPD_LAMBDA" \
         actor_rollout_ref.actor.policy_loss.multi_teacher_distill=False \
         actor_rollout_ref.actor.ppo_mini_batch_size=128 \
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -354,6 +328,7 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
         actor_rollout_ref.actor.fsdp_config.param_offload=False \
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+        actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
         actor_rollout_ref.rollout.name=vllm \
@@ -370,45 +345,11 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
         reward_model.reward_manager=naive \
-        trainer.gpt_rollout_score.enable="$GPT_ROLLOUT_SCORE_ENABLE" \
-        trainer.gpt_rollout_score.model="$GPT_ROLLOUT_SCORE_MODEL" \
-        trainer.gpt_rollout_score.reasoning_effort="$GPT_ROLLOUT_SCORE_REASONING_EFFORT" \
-        trainer.gpt_rollout_score.max_workers="$GPT_ROLLOUT_SCORE_MAX_WORKERS" \
-        trainer.gpt_rollout_score.timeout="$GPT_ROLLOUT_SCORE_TIMEOUT" \
-        trainer.gpt_rollout_score.retries="$GPT_ROLLOUT_SCORE_RETRIES" \
-        trainer.gpt_rollout_score.max_prompt_chars="$GPT_ROLLOUT_SCORE_MAX_PROMPT_CHARS" \
-        trainer.gpt_rollout_score.max_response_chars="$GPT_ROLLOUT_SCORE_MAX_RESPONSE_CHARS" \
-        trainer.gpt_rollout_score.max_output_tokens="$GPT_ROLLOUT_SCORE_MAX_OUTPUT_TOKENS" \
-        trainer.gpt_rollout_score.hint_retries="$GPT_ROLLOUT_SCORE_HINT_RETRIES" \
-        trainer.gpt_rollout_score.hint_max_output_tokens="$GPT_ROLLOUT_SCORE_HINT_MAX_OUTPUT_TOKENS" \
-        trainer.gpt_rollout_score.reroll_max_output_tokens="$GPT_ROLLOUT_SCORE_REROLL_MAX_OUTPUT_TOKENS" \
-        trainer.gpt_rollout_score.min_score_100="$GPT_ROLLOUT_SCORE_MIN_SCORE_100" \
-        trainer.gpt_rollout_score.max_rerollout_attempts="$GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS" \
-        trainer.gpt_rollout_score.max_reroll_context_tokens="$GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS" \
-        trainer.gpt_rollout_score.orig_loss_weight="$GPT_ROLLOUT_SCORE_ORIG_LOSS_WEIGHT" \
-        trainer.gpt_rollout_score.reroll_hint_loss_weight="$GPT_ROLLOUT_SCORE_REROLL_HINT_LOSS_WEIGHT" \
-        trainer.gpt_rollout_score.reroll_nohint_enable="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE" \
-        trainer.gpt_rollout_score.reroll_nohint_min_score="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_SCORE" \
-        trainer.gpt_rollout_score.reroll_nohint_min_gain="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_GAIN" \
-        trainer.gpt_rollout_score.reroll_nohint_max_weight="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_MAX_WEIGHT" \
-        trainer.gpt_rollout_score.reroll_nohint_gain_norm="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_GAIN_NORM" \
-        trainer.gpt_rollout_score.rubric_adv_shift_enable="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_ENABLE" \
-        trainer.gpt_rollout_score.rubric_adv_shift_mode="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_MODE" \
-        trainer.gpt_rollout_score.rubric_adv_shift_coef="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_COEF" \
-        trainer.gpt_rollout_score.rubric_adv_shift_clip="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_CLIP" \
-        trainer.gpt_rollout_score.rank_gap_drop_enable="$GPT_ROLLOUT_SCORE_RANK_GAP_DROP_ENABLE" \
-        trainer.gpt_rollout_score.rank_gap_drop_threshold="$GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD" \
-        trainer.gpt_rollout_score.rank_gap_drop_scope="$GPT_ROLLOUT_SCORE_RANK_GAP_DROP_SCOPE" \
-        trainer.gpt_rollout_score.rank_gap_case_study_dir="$GPT_ROLLOUT_SCORE_RANK_GAP_CASE_STUDY_DIR" \
-        trainer.gpt_rollout_score.case_study_dir="$GPT_ROLLOUT_SCORE_CASE_STUDY_DIR" \
-        trainer.gpt_rollout_score.case_study_max_per_step="$GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP" \
-        trainer.gpt_rollout_score.case_study_threshold_100="$GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100" \
-        trainer.gpt_rollout_score.case_study_include_errors="$GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS" \
-        trainer.gpt_rollout_score.verbose="$GPT_ROLLOUT_SCORE_VERBOSE" \
-        trainer.rollout_data_dir="$GPT_ROLLOUT_DATA_DIR" \
+        trainer.gpt_rollout_score.enable=False \
+        trainer.rollout_data_dir=null \
         trainer.critic_warmup=0 \
         trainer.val_before_train=True \
-        trainer.logger='["console","wandb"]' \
+        trainer.logger="$TRAINER_LOGGER" \
         trainer.log_val_generations=10 \
         trainer.project_name='on-policy-distillation' \
         trainer.experiment_name="$G_OPD_EXPERIMENT_NAME" \

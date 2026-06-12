@@ -146,7 +146,8 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
-  # Optional GPT scoring for training rollouts. This is logging-only and does not affect rewards or advantages.
+  # Optional GPT scoring for training rollouts. When enabled, low-score rollouts can be rerolled
+  # and appended as extra training rows. Rubric ranks can add a bounded advantage shift.
   gpt_rollout_score:
     enable: False
     model: chat-latest
@@ -158,13 +159,28 @@ trainer:
     # Legacy key names; values are interpreted as student-tokenizer token limits.
     max_prompt_chars: 2048
     max_response_chars: 4096
-    max_output_tokens: 1024
+    max_output_tokens: 768
+    hint_retries: 0
+    hint_max_output_tokens: 256
+    reroll_max_output_tokens: 512
     min_score_100: 50
     max_rerollout_attempts: 1
-    max_reroll_context_tokens: 1024
-    reroll_summary_model: null
-    reroll_summary_max_workers: null
-    reroll_summary_max_output_tokens: 1024
+    max_reroll_context_tokens: 256
+    orig_loss_weight: 1.0
+    reroll_hint_loss_weight: 0.5
+    reroll_nohint_enable: False
+    reroll_nohint_min_score: 50
+    reroll_nohint_min_gain: 10
+    reroll_nohint_max_weight: 0.5
+    reroll_nohint_gain_norm: 50
+    rubric_adv_shift_enable: False
+    rubric_adv_shift_mode: rank_residual
+    rubric_adv_shift_coef: 0.10
+    rubric_adv_shift_clip: 0.20
+    rank_gap_drop_enable: True
+    rank_gap_drop_threshold: 0.80
+    rank_gap_drop_scope: all
+    rank_gap_case_study_dir: null
 
     # Directory for low GPT-score case study JSONL dumps; no dump if null.
     case_study_dir: null

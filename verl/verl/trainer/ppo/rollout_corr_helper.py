@@ -731,8 +731,9 @@ def compute_offpolicy_metrics(
     Returns:
         Dictionary of off-policy metrics (without prefix)
     """
-    # Validate that we have at least one valid token
-    assert response_mask.any(), "Expected at least one valid token in response_mask"
+    # Padding-only micro-batches can appear after trainer-side batch padding.
+    if not response_mask.any():
+        return {"skipped_empty_response_mask": 1.0}
 
     metrics = {}
 

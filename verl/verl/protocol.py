@@ -210,6 +210,14 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     return output
 
 
+def list_of_dict_to_dict_of_list_sparse(list_of_dict: list[dict]):
+    output = {}
+    for data in list_of_dict:
+        for key, item in data.items():
+            output.setdefault(key, []).append(item)
+    return output
+
+
 def fold_batch_dim(data: "DataProto", new_batch_size):
     """
     Fold a batch dim from [bsz, xxx] into [new_bsz, bsz // new_bsz, xxx]
@@ -962,7 +970,7 @@ class DataProto:
 
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:
-                merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
+                merged_meta_info["metrics"] = list_of_dict_to_dict_of_list_sparse(all_metrics)
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)

@@ -784,6 +784,9 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if not loss_mask.any():
+        return loss_mat.sum() * 0.0
+
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
@@ -1626,6 +1629,10 @@ def compute_policy_loss_with_rollout_correction(
     """
     # Import rollout correction helper
     from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_rejection_mask
+
+    if not eos_mask.any():
+        pg_loss = log_prob.sum() * 0.0
+        return pg_loss, {"actor/skipped_empty_response_mask_micro_batches": 1.0}
 
     # Compute IS weights and rejection mask on-the-fly
     # Use no_grad since weights are detached inside and metrics don't need gradients

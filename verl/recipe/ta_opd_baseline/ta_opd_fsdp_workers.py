@@ -80,7 +80,6 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.metric.utils import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
@@ -752,7 +751,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        from verl.workers.actor import DataParallelPPOActor
+        from recipe.ta_opd_baseline.ta_opd_dp_actor import DataParallelPPOActor
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -804,7 +803,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
-            actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            actor_cfg = self.config.actor
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
@@ -938,7 +937,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
-            metrics = reduce_metrics(metrics)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -1030,18 +1028,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
+        policy_loss_config = self.config.actor.get("policy_loss", {}) or {}
+        ta_opd_config = policy_loss_config.get("ta_opd", {}) or {}
+        ta_opd_enabled = bool(ta_opd_config.get("enable", policy_loss_config.get("ta_opd_enable", False)))
+        ta_opd_method = str(ta_opd_config.get("method", "teachability")).lower()
+        ta_opd_requires_topk = ta_opd_enabled and ta_opd_method not in {"none", "full", "random", "entropy"}
+        ta_opd_exact_coverage = bool(ta_opd_config.get("exact_coverage", False))
+        ta_opd_return_student_topk = ta_opd_requires_topk and ta_opd_exact_coverage and not is_lora
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+        ref_topk = self.config.ref.get("topk_logits", None)
+        topk = int(ta_opd_config.get("topk", ref_topk if ref_topk is not None else 16))
+        renormalize_topk = bool(ta_opd_config.get("renormalize_topk", False))
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if ta_opd_return_student_topk:
+                    output, entropys, student_topk_logps, student_topk_indices = self.actor.compute_log_prob(
+                        data=data,
+                        calculate_entropy=True,
+                        return_topk=True,
+                        topk=topk,
+                        renormalize_topk=renormalize_topk,
+                    )
+                else:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    student_topk_logps = None
+                    student_topk_indices = None
+            output_tensors = {"old_log_probs": output, "entropys": entropys}
+            if ta_opd_return_student_topk:
+                output_tensors["student_topk_logps"] = student_topk_logps.float()
+                output_tensors["student_topk_indices"] = student_topk_indices.long()
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=output_tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
@@ -1061,7 +1084,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        policy_loss_config = self.config.actor.get("policy_loss", {}) or {}
+        ta_opd_config = policy_loss_config.get("ta_opd", {}) or {}
+        ta_opd_enabled = bool(ta_opd_config.get("enable", policy_loss_config.get("ta_opd_enable", False)))
+        ta_opd_method = str(ta_opd_config.get("method", "teachability")).lower()
+        ta_opd_requires_topk = ta_opd_enabled and ta_opd_method not in {"none", "full", "random", "entropy"}
+        ta_opd_exact_coverage = bool(ta_opd_config.get("exact_coverage", False))
         if self._is_lora:
+            if ta_opd_requires_topk:
+                raise RuntimeError("TA-OPD baseline requires a standalone ref model to produce teacher top-k tensors.")
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
             data = self.compute_log_prob(data)
@@ -1077,10 +1108,52 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        ref_topk = self.config.ref.get("topk_logits", None)
+        topk = int(ta_opd_config.get("topk", ref_topk if ref_topk is not None else 16))
+        renormalize_topk = bool(ta_opd_config.get("renormalize_topk", False))
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            if ta_opd_requires_topk:
+                if ta_opd_exact_coverage and "student_topk_indices" not in data.batch:
+                    raise RuntimeError(
+                        "TA-OPD exact coverage requires actor compute_log_prob to provide student_topk_indices."
+                    )
+                if ta_opd_exact_coverage:
+                    output, entropy, teacher_student_topk_logps, topk_logps, topk_indices = (
+                        self.ref_policy.compute_log_prob(
+                            data=data,
+                            calculate_entropy=True,
+                            return_topk=True,
+                            topk=topk,
+                            renormalize_topk=renormalize_topk,
+                            gather_token_indices_key="student_topk_indices",
+                        )
+                    )
+                else:
+                    output, entropy, topk_logps, topk_indices = self.ref_policy.compute_log_prob(
+                        data=data,
+                        calculate_entropy=True,
+                        return_topk=True,
+                        topk=topk,
+                        renormalize_topk=renormalize_topk,
+                    )
+                    teacher_student_topk_logps = None
+                if entropy is None or topk_logps is None or topk_indices is None:
+                    raise RuntimeError("TA-OPD ref policy did not return teacher entropy/top-k tensors.")
+                output_tensors = {
+                    "ref_log_prob": output,
+                    "teacher_entropy": entropy.float(),
+                    "teacher_topk_logps": topk_logps.float(),
+                    "teacher_topk_indices": topk_indices.long(),
+                }
+                if ta_opd_exact_coverage:
+                    if teacher_student_topk_logps is None:
+                        raise RuntimeError("TA-OPD ref policy did not return teacher scores on student top-k tokens.")
+                    output_tensors["teacher_student_topk_logps"] = teacher_student_topk_logps.float()
+                output = DataProto.from_dict(tensors=output_tensors)
+            else:
+                output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+                output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")
 
@@ -1662,7 +1735,6 @@ class CriticWorker(Worker, DistProfilerExtension):
             data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
             with Timer(name="update_critic", logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
-            metrics = reduce_metrics(metrics)
             delta_time = timer.last
 
             global_num_tokens = data.meta_info["global_token_num"]

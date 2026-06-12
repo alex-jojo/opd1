@@ -18,15 +18,29 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+
+
+
+# 1.鍒嗘。
+
+# 2.rubric浣滃樊
+
+
+
+
+
 import json
+import math
 import os
 import time
 import uuid
+import zipfile
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Optional
+from xml.sax.saxutils import escape as xml_escape
 
 import numpy as np
 import ray
@@ -67,6 +81,32 @@ def _is_truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off", "none", "null"}
     return bool(value)
+
+
+def _sanitize_metrics_for_logging(metrics: dict) -> tuple[dict, list[tuple[str, str]]]:
+    sanitized = {}
+    dropped = []
+    for key, value in metrics.items():
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                dropped.append((str(key), f"tensor_shape={tuple(value.shape)}"))
+                continue
+            value = value.detach().cpu().item()
+        elif isinstance(value, np.ndarray):
+            if value.size != 1:
+                dropped.append((str(key), f"ndarray_shape={value.shape}"))
+                continue
+            value = value.item()
+        elif isinstance(value, np.generic):
+            value = value.item()
+
+        if isinstance(value, bool):
+            sanitized[key] = int(value)
+        elif isinstance(value, (int, float)) and np.isfinite(value):
+            sanitized[key] = value
+        else:
+            dropped.append((str(key), type(value).__name__))
+    return sanitized, dropped
 
 
 def _g_opd_truthy(value) -> bool:
@@ -489,31 +529,29 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+        """Dump rollout/validation samples as Excel."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"{self.global_steps}.xlsx")
 
         n = len(inputs)
         base_data = {
+            "step": [self.global_steps] * n,
+            "row_idx": list(range(n)),
             "input": inputs,
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [self.global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
-        lines = []
+        entries = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            entries.append({k: v[i] for k, v in base_data.items()})
 
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
-
+        self._write_rows_to_xlsx(entries, filename)
         print(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
@@ -534,7 +572,7 @@ class RayPPOTrainer:
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
@@ -554,10 +592,20 @@ class RayPPOTrainer:
                 "gpt_rollout_initial_rubric_scores",
                 "gpt_rollout_initial_reason",
                 "gpt_rollout_initial_revision_suggestion",
+                "gpt_rollout_initial_revision_suggestion_source",
                 "gpt_rollout_initial_error",
                 "gpt_rollout_initial_model",
                 "gpt_rollout_initial_pass_score_threshold",
+                "gpt_rollout_revision_suggestion_source",
                 "gpt_rollout_reroll_count",
+                "g_opd_sample_kind",
+                "g_opd_loss_weight",
+                "g_opd_source_row_idx",
+                "g_opd_reroll_gain_100",
+                "g_opd_teacher_rank",
+                "g_opd_rubric_rank",
+                "g_opd_teacher_rubric_rank_gap",
+                "g_opd_padding_sample",
             ):
                 if key in batch.non_tensor_batch:
                     value = batch.non_tensor_batch[key]
@@ -587,6 +635,104 @@ class RayPPOTrainer:
         if isinstance(value, (list, tuple)):
             return [self._json_safe_value(v) for v in value]
         return value
+
+    def _excel_column_name(self, col_idx: int) -> str:
+        name = ""
+        col_idx += 1
+        while col_idx:
+            col_idx, remainder = divmod(col_idx - 1, 26)
+            name = chr(65 + remainder) + name
+        return name
+
+    def _excel_cell_text(self, value) -> str:
+        value = self._json_safe_value(value)
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list, tuple)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+        text = "".join(ch for ch in text if ch in "\t\n\r" or ord(ch) >= 32)
+        return text[:32767]
+
+    def _write_rows_to_xlsx(self, rows: list[dict], filename: str) -> None:
+        headers = []
+        for row in rows:
+            for key in row.keys():
+                if key not in headers:
+                    headers.append(key)
+        large_json_headers = {
+            key
+            for key in headers
+            if key in {"extra_info", "reward_model"} or key.endswith("rubric_scores")
+        }
+        headers = [key for key in headers if key not in large_json_headers] + [
+            key for key in headers if key in large_json_headers
+        ]
+
+        def cell_xml(row_idx: int, col_idx: int, value) -> str:
+            cell_ref = f"{self._excel_column_name(col_idx)}{row_idx}"
+            text = xml_escape(self._excel_cell_text(value))
+            space = ' xml:space="preserve"' if text.strip() != text else ""
+            return f'<c r="{cell_ref}" t="inlineStr"><is><t{space}>{text}</t></is></c>'
+
+        sheet_rows = []
+        header_cells = [cell_xml(1, col_idx, header) for col_idx, header in enumerate(headers)]
+        sheet_rows.append(f'<row r="1">{"".join(header_cells)}</row>')
+        for row_offset, row in enumerate(rows, start=2):
+            cells = [cell_xml(row_offset, col_idx, row.get(header, "")) for col_idx, header in enumerate(headers)]
+            sheet_rows.append(f'<row r="{row_offset}">{"".join(cells)}</row>')
+
+        worksheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<sheetData>{"".join(sheet_rows)}</sheetData></worksheet>'
+        )
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        )
+        workbook_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            'Target="worksheets/sheet1.xml"/></Relationships>'
+        )
+        root_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="xl/workbook.xml"/></Relationships>'
+        )
+        content_types_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '</Types>'
+        )
+
+        with zipfile.ZipFile(filename, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", content_types_xml)
+            zf.writestr("_rels/.rels", root_rels_xml)
+            zf.writestr("xl/workbook.xml", workbook_xml)
+            zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+            zf.writestr("xl/worksheets/sheet1.xml", worksheet_xml)
+
+    def _write_rows_to_jsonl(self, rows: list[dict], filename: str) -> None:
+        dirname = os.path.dirname(filename)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        with open(filename, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(self._json_safe_value(row), ensure_ascii=False) + "\n")
 
     def _get_non_tensor_row_value(self, batch: DataProto, key: str, idx: int, default=None):
         if key not in batch.non_tensor_batch:
@@ -638,7 +784,7 @@ class RayPPOTrainer:
                 if include_errors:
                     low_idxs.append(idx)
                 continue
-            if np.isfinite(score_value) and score_value <= threshold_100:
+            if np.isfinite(score_value) and score_value < threshold_100:
                 low_idxs.append(idx)
         return low_idxs
 
@@ -657,19 +803,13 @@ class RayPPOTrainer:
         if threshold_config is None or str(threshold_config).strip().lower() in {"", "none", "null"}:
             threshold_config = scorer_config.get("min_score_100", 50.0)
         threshold_100 = float(threshold_config)
-        max_cases_per_step = int(scorer_config.get("case_study_max_per_step", 16))
-        if max_cases_per_step <= 0:
-            return
-
         include_errors = _is_truthy(scorer_config.get("case_study_include_errors", False))
         low_idxs = self._get_gpt_case_study_low_idxs(
             result["scores_100"],
             threshold_100=threshold_100,
             include_errors=include_errors,
         )
-        if not low_idxs:
-            return
-        selected_idxs = low_idxs[:max_cases_per_step]
+        selected_idxs = list(range(len(result["scores_100"])))
 
         entries = []
         for idx in selected_idxs:
@@ -684,41 +824,37 @@ class RayPPOTrainer:
                 {
                     "step": self.global_steps,
                     "row_idx": idx,
-                    "threshold_100": threshold_100,
-                    "input": prompt_text,
-                    "output": response_text,
-                    "student_first_input": prompt_text,
-                    "student_first_output": response_text,
-                    "student_second_input": None,
-                    "student_second_output": None,
-                    "student_second_attempted": False,
-                    "student_second_attempt": None,
-                    "student_second_accepted": None,
-                    "student_second_rejected_reason": None,
-                    "student_second_score_delta_100": None,
-                    "student_second_gpt_score": None,
-                    "student_second_gpt_score_100": None,
-                    "student_second_gpt_weighted_score_1_to_4": None,
-                    "student_second_gpt_rubric_scores": None,
-                    "student_second_gpt_reason": "",
-                    "student_second_gpt_revision_suggestion": "",
-                    "student_second_gpt_error": "",
-                    "student_second_gpt_model": None,
-                    "student_reroll_count": 0,
-                    "problem": extra_info.get("problem") if isinstance(extra_info, dict) else None,
-                    "gts": ground_truth,
-                    "data_source": self._get_non_tensor_row_value(batch, "data_source", idx, None),
-                    "request_id": self._get_non_tensor_row_value(batch, "request_id", idx, None),
-                    "extra_info": extra_info,
-                    "reward_model": reward_model,
-                    "gpt_score": result["scores"][idx],
-                    "gpt_score_100": result["scores_100"][idx],
-                    "gpt_weighted_score_1_to_4": result["weighted_scores_1_to_4"][idx],
-                    "gpt_rubric_scores": result["rubric_scores"][idx],
+                    "problem": extra_info.get("problem") if isinstance(extra_info, dict) else prompt_text,
+                    "ground_truth": ground_truth,
+                    "first_output": response_text,
+                    "final_output": response_text,
+                    "rule_score": None,
+                    "acc": None,
+                    "pred": None,
+                    "first_gpt_score_100": result["scores_100"][idx],
+                    "second_gpt_score_100": None,
+                    "final_gpt_score_100": result["scores_100"][idx],
+                    "is_low_score_case": idx in low_idxs,
+                    "reroll_count": 0,
+                    "second_output": None,
+                    "second_accepted": None,
+                    "second_score_delta_100": None,
                     "gpt_reason": result["reasons"][idx],
                     "gpt_revision_suggestion": result["revision_suggestions"][idx],
                     "gpt_error": result["errors"][idx],
-                    "gpt_model": result["models"][idx],
+                    "threshold_100": threshold_100,
+                    "data_source": self._get_non_tensor_row_value(batch, "data_source", idx, None),
+                    "request_id": self._get_non_tensor_row_value(batch, "request_id", idx, None),
+                    "uid": self._get_non_tensor_row_value(batch, "uid", idx, None),
+                    "first_gpt_weighted_score_1_to_4": result["weighted_scores_1_to_4"][idx],
+                    "second_gpt_weighted_score_1_to_4": None,
+                    "second_gpt_reason": "",
+                    "second_gpt_revision_suggestion": "",
+                    "second_gpt_error": "",
+                    "extra_info": extra_info,
+                    "reward_model": reward_model,
+                    "first_gpt_rubric_scores": result["rubric_scores"][idx],
+                    "second_gpt_rubric_scores": None,
                 }
             )
 
@@ -745,11 +881,8 @@ class RayPPOTrainer:
 
         with marked_timer("dump_gpt_low_score_cases", timing_raw, color="green"):
             os.makedirs(case_study_dir, exist_ok=True)
-            filename = os.path.join(case_study_dir, f"{self.global_steps}.jsonl")
-            lines = [json.dumps(self._json_safe_value(entry), ensure_ascii=False) for entry in entries]
-
-            with open(filename, "w") as f:
-                f.write("\n".join(lines) + "\n")
+            filename = os.path.join(case_study_dir, f"{self.global_steps}.xlsx")
+            self._write_rows_to_xlsx([self._json_safe_value(entry) for entry in entries], filename)
 
             self._debug_progress(
                 f"gpt_case_study:dumped selected={selected_count} low_count={low_count} file={filename}"
@@ -805,27 +938,26 @@ class RayPPOTrainer:
 
             entry.update(
                 {
-                    "student_second_input": second_input,
-                    "student_second_output": second_output,
-                    "student_second_attempted": True,
-                    "student_second_attempt": attempt + 1,
-                    "student_second_accepted": accepted,
-                    "student_second_rejected_reason": rejected_reason,
-                    "student_second_score_delta_100": score_delta_100,
-                    "student_second_gpt_score": reroll_score_result["scores"][output_position],
-                    "student_second_gpt_score_100": second_score_100,
-                    "student_second_gpt_weighted_score_1_to_4": reroll_score_result[
+                    "second_input": second_input,
+                    "second_output": second_output,
+                    "second_attempted": True,
+                    "second_attempt": attempt + 1,
+                    "second_appended": accepted,
+                    "second_accepted": accepted,
+                    "second_rejected_reason": rejected_reason,
+                    "second_score_delta_100": score_delta_100,
+                    "second_gpt_score_100": second_score_100,
+                    "second_gpt_weighted_score_1_to_4": reroll_score_result[
                         "weighted_scores_1_to_4"
                     ][output_position],
-                    "student_second_gpt_rubric_scores": reroll_score_result["rubric_scores"][
+                    "second_gpt_rubric_scores": reroll_score_result["rubric_scores"][
                         output_position
                     ],
-                    "student_second_gpt_reason": reroll_score_result["reasons"][output_position],
-                    "student_second_gpt_revision_suggestion": reroll_score_result[
+                    "second_gpt_reason": reroll_score_result["reasons"][output_position],
+                    "second_gpt_revision_suggestion": reroll_score_result[
                         "revision_suggestions"
                     ][output_position],
-                    "student_second_gpt_error": reroll_score_result["errors"][output_position],
-                    "student_second_gpt_model": reroll_score_result["models"][output_position],
+                    "second_gpt_error": reroll_score_result["errors"][output_position],
                 }
             )
 
@@ -847,16 +979,16 @@ class RayPPOTrainer:
         for entry in entries:
             idx = int(entry["row_idx"])
             reroll_count = int(reroll_counts[idx])
-            entry["student_reroll_count"] = reroll_count
-            if entry.get("student_second_attempted"):
+            entry["reroll_count"] = reroll_count
+            if entry.get("second_attempted"):
                 attempted_count += 1
             if reroll_count <= 0:
                 continue
 
-            _, second_output = self._decode_rollout_prompt_response(batch=batch, idx=idx)
-            entry["student_second_output"] = second_output
-            entry["student_second_accepted"] = True
-            entry["student_second_rejected_reason"] = None
+            entry["second_appended"] = True
+            entry["second_accepted"] = False
+            entry["second_rejected_reason"] = "appended_not_replaced"
+            entry["final_output"] = entry.get("first_output")
             updated_count += 1
 
         if updated_count == 0 and attempted_count == 0:
@@ -873,8 +1005,64 @@ class RayPPOTrainer:
             f"gpt_case_study:updated_second_outputs accepted={updated_count} attempted={attempted_count}"
         )
 
+    def _maybe_update_gpt_case_study_rule_scores(
+        self,
+        batch: DataProto,
+        initial_score_result: dict | None,
+        reward_extra_infos_dict: dict,
+        timing_raw: dict,
+    ) -> None:
+        if initial_score_result is None:
+            return
+        case_study_dir = initial_score_result.get("_case_study_dir")
+        entries = initial_score_result.get("_case_study_entries")
+        if not case_study_dir or not entries:
+            return
+
+        sequence_scores = batch.batch["token_level_scores"].sum(-1).detach().cpu().tolist()
+        uid_to_pos = {}
+        if "uid" in batch.non_tensor_batch:
+            for pos, uid in enumerate(batch.non_tensor_batch["uid"].tolist()):
+                uid_to_pos[str(uid)] = pos
+
+        def aligned_value(key: str, pos: int):
+            values = reward_extra_infos_dict.get(key)
+            if values is None or pos >= len(values):
+                return None
+            return self._json_safe_value(values[pos])
+
+        updated_count = 0
+        for entry in entries:
+            pos = None
+            uid = entry.get("uid")
+            if uid is not None:
+                pos = uid_to_pos.get(str(uid))
+            if pos is None:
+                row_idx = int(entry["row_idx"])
+                if 0 <= row_idx < len(sequence_scores):
+                    pos = row_idx
+            if pos is None or pos >= len(sequence_scores):
+                continue
+
+            entry["rule_score"] = self._json_safe_value(sequence_scores[pos])
+            entry["acc"] = aligned_value("acc", pos)
+            entry["pred"] = aligned_value("pred", pos)
+            updated_count += 1
+
+        if updated_count <= 0:
+            return
+
+        self._write_gpt_rollout_case_studies(
+            case_study_dir=case_study_dir,
+            entries=entries,
+            timing_raw=timing_raw,
+            selected_count=len(entries),
+            low_count=sum(1 for entry in entries if entry.get("is_low_score_case")),
+        )
+        self._debug_progress(f"gpt_case_study:updated_rule_scores count={updated_count}")
+
     def _gpt_rollout_result_values(self, result: dict, prefix: str) -> dict:
-        return {
+        values = {
             f"{prefix}_score": result["scores"],
             f"{prefix}_score_100": result["scores_100"],
             f"{prefix}_weighted_score_1_to_4": result["weighted_scores_1_to_4"],
@@ -884,6 +1072,9 @@ class RayPPOTrainer:
             f"{prefix}_error": result["errors"],
             f"{prefix}_model": result["models"],
         }
+        if "revision_suggestion_sources" in result:
+            values[f"{prefix}_revision_suggestion_source"] = result["revision_suggestion_sources"]
+        return values
 
     def _get_gpt_rollout_pass_flags(self, scores_100: list, threshold_100: float) -> list[bool]:
         pass_flags = []
@@ -893,7 +1084,7 @@ class RayPPOTrainer:
             except (TypeError, ValueError):
                 pass_flags.append(False)
                 continue
-            pass_flags.append(np.isfinite(score_value) and score_value > threshold_100)
+            pass_flags.append(np.isfinite(score_value) and score_value >= threshold_100)
         return pass_flags
 
     def _set_gpt_rollout_result(
@@ -957,11 +1148,77 @@ class RayPPOTrainer:
         metrics[f"{prefix}/pass_count"] = int(sum(pass_flags))
         metrics[f"{prefix}/low_count"] = len(pass_flags) - int(sum(pass_flags))
 
+    def _fallback_reroll_revision_suggestion(self, score_100: float) -> str:
+        if score_100 < 35.0:
+            return (
+                "Re-read the problem, identify the target and key constraints, then build a direct setup before computing."
+            )
+        if score_100 < 45.0:
+            return (
+                "Keep the useful setup, then check the first weak inference and use the constraints to finish the reasoning."
+            )
+        return (
+            "Verify the final computation, conditions, and answer extraction against the original problem before concluding."
+        )
+
+    def _count_low_score_no_revision_suggestion(self, result: dict, threshold_100: float) -> int:
+        count = 0
+        scores_100 = result.get("scores_100", [])
+        suggestions = result.get("revision_suggestions", [])
+        for idx, score_100 in enumerate(scores_100):
+            score_value = self._finite_gpt_score_value(score_100)
+            if score_value is None or score_value >= threshold_100:
+                continue
+            suggestion = suggestions[idx] if idx < len(suggestions) else ""
+            if not str(suggestion or "").strip():
+                count += 1
+        return count
+
+    def _count_revision_suggestion_sources(self, result: dict, source_names: set[str]) -> int:
+        sources = result.get("revision_suggestion_sources", [])
+        return sum(1 for source in sources if str(source or "") in source_names)
+
+    def _ensure_low_score_revision_suggestions(
+        self,
+        result: dict,
+        threshold_100: float,
+        *,
+        fallback_source: str = "trainer_local_fallback",
+    ) -> int:
+        scores_100 = result.get("scores_100", [])
+        if "revision_suggestions" not in result or not isinstance(result["revision_suggestions"], list):
+            result["revision_suggestions"] = ["" for _ in scores_100]
+        if len(result["revision_suggestions"]) < len(scores_100):
+            result["revision_suggestions"].extend(["" for _ in range(len(scores_100) - len(result["revision_suggestions"]))])
+        if "revision_suggestion_sources" not in result or not isinstance(result["revision_suggestion_sources"], list):
+            result["revision_suggestion_sources"] = ["" for _ in scores_100]
+        if len(result["revision_suggestion_sources"]) < len(scores_100):
+            result["revision_suggestion_sources"].extend(
+                ["" for _ in range(len(scores_100) - len(result["revision_suggestion_sources"]))]
+            )
+
+        fallback_count = 0
+        for idx, score_100 in enumerate(scores_100):
+            score_value = self._finite_gpt_score_value(score_100)
+            if score_value is None or score_value >= threshold_100:
+                continue
+            if str(result["revision_suggestions"][idx] or "").strip():
+                continue
+            result["revision_suggestions"][idx] = self._fallback_reroll_revision_suggestion(score_value)
+            result["revision_suggestion_sources"][idx] = fallback_source
+            fallback_count += 1
+        return fallback_count
+
     def _score_gpt_rollouts(self, batch: DataProto, scorer_config: dict, timing_raw: dict, timer_name: str) -> dict:
         with marked_timer(timer_name, timing_raw, color="green"):
             from verl.trainer.ppo.gpt_rollout_scorer import score_rollouts_with_gpt
 
             return score_rollouts_with_gpt(batch=batch, tokenizer=self.tokenizer, config=scorer_config)
+
+    def _reroll_gpt_scorer_config(self, scorer_config: dict) -> dict:
+        config = OmegaConf.to_container(scorer_config, resolve=True) if OmegaConf.is_config(scorer_config) else dict(scorer_config)
+        config["max_output_tokens"] = int(config.get("reroll_max_output_tokens", 512))
+        return config
 
     def _maybe_score_gpt_rollouts(self, batch: DataProto, metrics: dict, timing_raw: dict) -> Optional[dict]:
         scorer_config = self.config.trainer.get("gpt_rollout_score", None)
@@ -970,12 +1227,29 @@ class RayPPOTrainer:
 
         self._debug_progress(
             f"gpt_rollout_score:start batch_size={len(batch)} "
-            f"model={scorer_config.get('model', '?')} max_workers={scorer_config.get('max_workers', '?')}"
+            f"model={scorer_config.get('model', '?')} max_workers={scorer_config.get('max_workers', '?')} "
+            f"max_output_tokens={scorer_config.get('max_output_tokens', '?')}"
         )
         result = self._score_gpt_rollouts(
             batch=batch, scorer_config=scorer_config, timing_raw=timing_raw, timer_name="gpt_rollout_score"
         )
         min_score_100 = float(scorer_config.get("min_score_100", 50.0))
+        low_no_hint_before = self._count_low_score_no_revision_suggestion(result, min_score_100)
+        local_hint_fallback_count = self._ensure_low_score_revision_suggestions(result, min_score_100)
+        scorer_hint_fallback_count = self._count_revision_suggestion_sources(
+            result,
+            {"local_fallback"},
+        )
+        gpt_hint_retry_count = self._count_revision_suggestion_sources(
+            result,
+            {"gpt_hint_retry"},
+        )
+        metrics["gpt_rollout_score/low_no_hint_count"] = low_no_hint_before + scorer_hint_fallback_count
+        metrics["gpt_rollout_score/local_hint_fallback_count"] = local_hint_fallback_count + scorer_hint_fallback_count
+        metrics["gpt_rollout_score/gpt_hint_retry_count"] = gpt_hint_retry_count
+        metrics["gpt_rollout_score/initial_missing_hint_count"] = (
+            gpt_hint_retry_count + scorer_hint_fallback_count + local_hint_fallback_count
+        )
         self._set_gpt_rollout_result(
             batch=batch, result=result, prefix="gpt_rollout", threshold_100=min_score_100
         )
@@ -1018,7 +1292,7 @@ class RayPPOTrainer:
             except (TypeError, ValueError):
                 low_idxs.append(idx)
                 continue
-            if not np.isfinite(score_value) or score_value <= threshold_100:
+            if not np.isfinite(score_value) or score_value < threshold_100:
                 low_idxs.append(idx)
         return low_idxs
 
@@ -1043,140 +1317,60 @@ class RayPPOTrainer:
             return None
         return score_value if np.isfinite(score_value) else None
 
-    def _is_reroll_score_better(self, reroll_score_100: object, initial_score_100: object) -> bool:
-        reroll_value = self._finite_gpt_score_value(reroll_score_100)
-        if reroll_value is None:
-            return False
-
-        initial_value = self._finite_gpt_score_value(initial_score_100)
-        if initial_value is None:
-            return True
-
-        return reroll_value > initial_value
-
     def _select_gpt_rollout_result(self, result: dict, positions: list[int]) -> dict:
         return {
             key: [values[position] for position in positions] if isinstance(values, list) else values
             for key, values in result.items()
         }
 
-    def _render_reroll_context(self, previous_solution: str, feedback: dict) -> str:
-        feedback_json = json.dumps(feedback, ensure_ascii=False)
+    def _render_reroll_context(self, hint: str) -> str:
+        hint = str(hint or "").strip()
+        if not hint:
+            return ""
         return (
-            "[Previous Solution]\n"
-            f"{previous_solution}\n\n"
-            "[GPT Feedback on Previous Solution]\n"
-            f"{feedback_json}"
+            "[hint]\n"
+            f"{hint}"
         )
+
+    def _normalize_reroll_context(self, reroll_context: str) -> str:
+        reroll_context = str(reroll_context or "").strip()
+        if not reroll_context:
+            return ""
+        hint_header = "[hint]"
+        if reroll_context.lower().startswith(hint_header):
+            hint = reroll_context[len(hint_header) :].strip()
+            return self._render_reroll_context(hint)
+        return self._render_reroll_context(reroll_context)
+
+    def _truncate_reroll_context(self, reroll_context: str, max_context_tokens: int) -> str:
+        reroll_context = self._normalize_reroll_context(reroll_context)
+        if not reroll_context:
+            return ""
+        context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
+        if len(context_ids) <= max_context_tokens:
+            return reroll_context
+
+        hint_header = "[hint]\n"
+        header_ids = self.tokenizer.encode(hint_header, add_special_tokens=False)
+        hint_budget = max_context_tokens - len(header_ids)
+        if hint_budget <= 0:
+            return ""
+
+        hint = reroll_context[len("[hint]") :].strip()
+        hint_ids = self.tokenizer.encode(hint, add_special_tokens=False)
+        truncated_hint = self.tokenizer.decode(hint_ids[:hint_budget], skip_special_tokens=True).strip()
+        return self._render_reroll_context(truncated_hint)
 
     def _render_reroll_prompt_suffix(self, problem: str, reroll_context: str) -> str:
         return (
             "[Problem]\n"
             f"{problem}\n\n"
-            f"{reroll_context}\n\n"
-            "Please solve the problem above again.\n"
-            "Do not discuss the feedback explicitly.\n"
-            "Do not mention the previous solution.\n"
-            "Produce a clean corrected solution only.\n"
-            "Be concise.\n"
-            "End with the final answer."
+            f"{reroll_context}"
         )
 
-    def _build_gpt_feedback_for_reroll_context(self, result: dict, idx: int, previous_solution: str = "") -> str:
-        rubric_scores = result["rubric_scores"][idx]
+    def _build_gpt_feedback_for_reroll_context(self, result: dict, idx: int) -> str:
         revision_suggestion = result["revision_suggestions"][idx]
-
-        feedback = {}
-        if isinstance(rubric_scores, dict):
-            sanitized_rubric = {}
-            for name, score_info in rubric_scores.items():
-                if isinstance(score_info, dict):
-                    sanitized_rubric[name] = {
-                        key: value for key, value in score_info.items() if key != "weight"
-                    }
-                else:
-                    sanitized_rubric[name] = score_info
-            feedback["rubric_scores"] = sanitized_rubric
-
-        if revision_suggestion:
-            feedback["revision_suggestion"] = revision_suggestion
-
-        if not feedback:
-            return ""
-
-        return self._render_reroll_context(previous_solution=previous_solution, feedback=feedback)
-
-    def _get_reroll_summary_max_workers(self, scorer_config: dict, job_count: int) -> int:
-        raw_value = scorer_config.get("reroll_summary_max_workers", None)
-        if raw_value is None:
-            raw_value = scorer_config.get("max_workers", 8)
-        try:
-            max_workers = int(raw_value)
-        except (TypeError, ValueError):
-            max_workers = 8
-        return min(max(max_workers, 1), max(job_count, 1))
-
-    def _format_gpt_feedback_for_reroll(
-        self,
-        result: dict,
-        idx: int,
-        problem: str = "",
-        previous_solution: str = "",
-        scorer_config: Optional[dict] = None,
-    ) -> str:
-        reroll_context = self._build_gpt_feedback_for_reroll_context(
-            result=result,
-            idx=idx,
-            previous_solution=previous_solution,
-        )
-        if not reroll_context:
-            return ""
-
-        if scorer_config is None:
-            return self._render_reroll_prompt_suffix(problem=problem, reroll_context=reroll_context)
-
-        max_context_tokens = max(
-            1,
-            int(
-                scorer_config.get(
-                    "max_reroll_context_tokens",
-                    scorer_config.get("max_reroll_feedback_tokens", 1024),
-                )
-            ),
-        )
-        context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
-        if len(context_ids) <= max_context_tokens:
-            return self._render_reroll_prompt_suffix(problem=problem, reroll_context=reroll_context)
-
-        try:
-            from verl.trainer.ppo.gpt_rollout_scorer import summarize_reroll_context_with_gpt
-
-            summary = summarize_reroll_context_with_gpt(
-                context=reroll_context,
-                target_tokens=max_context_tokens,
-                config=scorer_config,
-                request_idx=idx + 1,
-                verbose=_is_truthy(scorer_config.get("verbose", False)),
-            )
-        except Exception as exc:
-            summary = {
-                "reroll_context": reroll_context,
-                "error": str(exc),
-            }
-
-        if summary.get("error"):
-            self._debug_progress(f"gpt_reroll_summary:failed idx={idx} error={str(summary['error'])[:240]}")
-
-        reroll_context = summary.get("reroll_context") or reroll_context
-        context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
-        if len(context_ids) > max_context_tokens:
-            self._debug_progress(
-                f"gpt_reroll_context:summary_still_too_long idx={idx} tokens={len(context_ids)} "
-                f"limit={max_context_tokens}; applying context tail fallback"
-            )
-            reroll_context = self.tokenizer.decode(context_ids[-max_context_tokens:], skip_special_tokens=True)
-
-        return self._render_reroll_prompt_suffix(problem=problem, reroll_context=reroll_context)
+        return self._render_reroll_context(hint=revision_suggestion)
 
     def _append_gpt_feedback_to_reroll_prompts(
         self,
@@ -1185,9 +1379,9 @@ class RayPPOTrainer:
         row_idxs: list[int],
         initial_score_result: dict,
         scorer_config: dict,
-    ) -> int:
+    ) -> tuple[list[int], int]:
         if not row_idxs:
-            return 0
+            return [], 0
 
         input_ids = gen_batch.batch["input_ids"]
         attention_mask = gen_batch.batch["attention_mask"]
@@ -1203,12 +1397,14 @@ class RayPPOTrainer:
             ),
         )
         if max_context_tokens == 0:
-            return 0
+            return [], 0
+        threshold_100 = float(scorer_config.get("min_score_100", 50.0))
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
 
         feedback_requests = []
+        local_hint_fallback_count = 0
         for idx in row_idxs:
             valid_prompt_len = int(attention_mask[idx].sum().item())
             if valid_prompt_len > 0:
@@ -1225,25 +1421,25 @@ class RayPPOTrainer:
             if not problem:
                 problem = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
 
-            previous_solution = ""
-            if "responses" in batch.batch:
-                response_ids = batch.batch["responses"][idx]
-                response_mask = batch.batch.get("response_mask", None)
-                if response_mask is not None:
-                    valid_response_len = int(response_mask[idx].sum().item())
-                    response_ids = response_ids[:valid_response_len]
-                previous_solution = self.tokenizer.decode(
-                    response_ids.detach().cpu().tolist(),
-                    skip_special_tokens=True,
-                )
-
             reroll_context = self._build_gpt_feedback_for_reroll_context(
                 result=initial_score_result,
                 idx=idx,
-                previous_solution=previous_solution,
             )
             if not reroll_context:
-                continue
+                score_value = self._finite_gpt_score_value(initial_score_result["scores_100"][idx])
+                if score_value is not None and score_value < threshold_100:
+                    fallback_hint = self._fallback_reroll_revision_suggestion(score_value)
+                    initial_score_result["revision_suggestions"][idx] = fallback_hint
+                    if "revision_suggestion_sources" in initial_score_result:
+                        initial_score_result["revision_suggestion_sources"][idx] = "prompt_local_fallback"
+                    if "gpt_rollout_revision_suggestion" in batch.non_tensor_batch:
+                        batch.non_tensor_batch["gpt_rollout_revision_suggestion"][idx] = fallback_hint
+                    if "gpt_rollout_revision_suggestion_source" in batch.non_tensor_batch:
+                        batch.non_tensor_batch["gpt_rollout_revision_suggestion_source"][idx] = "prompt_local_fallback"
+                    reroll_context = self._render_reroll_context(hint=fallback_hint)
+                    local_hint_fallback_count += 1
+                if not reroll_context:
+                    continue
 
             context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
             feedback_requests.append(
@@ -1252,61 +1448,21 @@ class RayPPOTrainer:
                     "valid_prompt_ids": valid_prompt_ids,
                     "problem": problem,
                     "reroll_context": reroll_context,
-                    "needs_summary": len(context_ids) > max_context_tokens,
                 }
             )
 
-        summary_results = {}
-        summary_jobs = [request for request in feedback_requests if request["needs_summary"]]
-        if summary_jobs:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            from verl.trainer.ppo.gpt_rollout_scorer import summarize_reroll_context_with_gpt
-
-            summary_max_workers = self._get_reroll_summary_max_workers(scorer_config, len(summary_jobs))
-            self._debug_progress(
-                f"gpt_reroll_summary:start count={len(summary_jobs)} max_workers={summary_max_workers}"
-            )
-            with ThreadPoolExecutor(max_workers=summary_max_workers) as executor:
-                future_to_request = {
-                    executor.submit(
-                        summarize_reroll_context_with_gpt,
-                        context=request["reroll_context"],
-                        target_tokens=max_context_tokens,
-                        config=scorer_config,
-                        request_idx=request["idx"] + 1,
-                        verbose=_is_truthy(scorer_config.get("verbose", False)),
-                    ): request
-                    for request in summary_jobs
-                }
-                for future in as_completed(future_to_request):
-                    request = future_to_request[future]
-                    try:
-                        summary = future.result()
-                    except Exception as exc:
-                        summary = {
-                            "reroll_context": "",
-                            "error": str(exc),
-                        }
-                    summary_results[request["idx"]] = summary
-            self._debug_progress(f"gpt_reroll_summary:done count={len(summary_jobs)}")
-
-        appended_count = 0
+        appended_idxs = []
         for request in feedback_requests:
             idx = request["idx"]
-            reroll_context = request["reroll_context"]
-            if request["needs_summary"]:
-                summary = summary_results.get(idx, {})
-                if summary.get("error"):
-                    self._debug_progress(f"gpt_reroll_summary:failed idx={idx} error={str(summary['error'])[:240]}")
-                reroll_context = summary.get("reroll_context") or reroll_context
+            reroll_context = self._normalize_reroll_context(request["reroll_context"])
 
-            context_ids = self.tokenizer.encode(reroll_context, add_special_tokens=False)
-            if len(context_ids) > max_context_tokens:
+            if len(self.tokenizer.encode(reroll_context, add_special_tokens=False)) > max_context_tokens:
                 self._debug_progress(
-                    f"gpt_reroll_context:summary_still_too_long idx={idx} tokens={len(context_ids)} "
-                    f"limit={max_context_tokens}; applying context tail fallback"
+                    f"gpt_reroll_context:too_long idx={idx} limit={max_context_tokens}; truncating hint"
                 )
-                reroll_context = self.tokenizer.decode(context_ids[-max_context_tokens:], skip_special_tokens=True)
+                reroll_context = self._truncate_reroll_context(reroll_context, max_context_tokens)
+            if not reroll_context:
+                continue
 
             feedback_text = self._render_reroll_prompt_suffix(
                 problem=request["problem"],
@@ -1324,7 +1480,10 @@ class RayPPOTrainer:
                 continue
 
             if len(combined_ids) > prompt_length:
-                combined_ids = combined_ids[-prompt_length:]
+                self._debug_progress(
+                    f"gpt_reroll_prompt:skip_too_long idx={idx} tokens={len(combined_ids)} limit={prompt_length}"
+                )
+                continue
 
             new_input_ids = torch.full_like(input_ids[idx], int(pad_token_id))
             new_attention_mask = torch.zeros_like(attention_mask[idx])
@@ -1347,9 +1506,9 @@ class RayPPOTrainer:
                     .expand_as(position_ids[idx])
                 )
 
-            appended_count += 1
+            appended_idxs.append(idx)
 
-        return appended_count
+        return appended_idxs, local_hint_fallback_count
 
     def _mark_gpt_rollout_result_unscored_after_reroll(self, batch: DataProto, row_idxs: list[int]) -> None:
         if not row_idxs:
@@ -1392,6 +1551,558 @@ class RayPPOTrainer:
             if key in batch.non_tensor_batch:
                 batch.non_tensor_batch[key][row_idxs_np] = value
 
+    def _ensure_g_opd_sample_metadata(
+        self,
+        batch: DataProto,
+        *,
+        kind: str = "orig",
+        loss_weight: float = 1.0,
+    ) -> None:
+        n = len(batch)
+        defaults = {
+            "g_opd_sample_kind": np.full(n, kind, dtype=object),
+            "g_opd_loss_weight": np.full(n, float(loss_weight), dtype=np.float32),
+            "g_opd_source_row_idx": np.arange(n, dtype=object),
+            "g_opd_reroll_gain_100": np.zeros(n, dtype=np.float32),
+            "gpt_rollout_reroll_count": np.zeros(n, dtype=object),
+        }
+        for key, value in defaults.items():
+            if key not in batch.non_tensor_batch or len(batch.non_tensor_batch[key]) != n:
+                batch.non_tensor_batch[key] = value
+
+    def _set_reroll_sample_metadata(
+        self,
+        batch: DataProto,
+        *,
+        source_row_idxs: list[int],
+        initial_score_result: dict,
+        reroll_score_result: dict,
+        loss_weight: float,
+    ) -> None:
+        n = len(batch)
+        gains = []
+        for output_position, source_idx in enumerate(source_row_idxs):
+            initial_score = initial_score_result["scores_100"][source_idx]
+            reroll_score = reroll_score_result["scores_100"][output_position]
+            initial_value = self._finite_gpt_score_value(initial_score)
+            reroll_value = self._finite_gpt_score_value(reroll_score)
+            gains.append(0.0 if initial_value is None or reroll_value is None else reroll_value - initial_value)
+
+        batch.non_tensor_batch["g_opd_sample_kind"] = np.full(n, "reroll_hint", dtype=object)
+        batch.non_tensor_batch["g_opd_loss_weight"] = np.full(n, float(loss_weight), dtype=np.float32)
+        batch.non_tensor_batch["g_opd_source_row_idx"] = np.array(source_row_idxs, dtype=object)
+        batch.non_tensor_batch["g_opd_reroll_gain_100"] = np.array(gains, dtype=np.float32)
+        batch.non_tensor_batch["gpt_rollout_reroll_count"] = np.ones(n, dtype=object)
+        if "uid" in batch.non_tensor_batch:
+            batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(n)], dtype=object)
+
+    def _build_reroll_nohint_batch(
+        self,
+        *,
+        original_batch: DataProto,
+        reroll_batch: DataProto,
+        source_row_idxs: list[int],
+        initial_score_result: dict,
+        reroll_score_result: dict,
+        scorer_config: dict,
+        threshold_100: float,
+    ) -> DataProto | None:
+        if not _is_truthy(scorer_config.get("reroll_nohint_enable", False)):
+            return None
+
+        min_score = float(scorer_config.get("reroll_nohint_min_score", threshold_100))
+        min_gain = float(scorer_config.get("reroll_nohint_min_gain", 10.0))
+        max_weight = float(scorer_config.get("reroll_nohint_max_weight", 0.5))
+        gain_norm = max(float(scorer_config.get("reroll_nohint_gain_norm", 50.0)), 1e-6)
+
+        selected_positions = []
+        selected_source_idxs = []
+        selected_weights = []
+        selected_gains = []
+        for output_position, source_idx in enumerate(source_row_idxs):
+            initial_value = self._finite_gpt_score_value(initial_score_result["scores_100"][source_idx])
+            reroll_value = self._finite_gpt_score_value(reroll_score_result["scores_100"][output_position])
+            if initial_value is None or reroll_value is None:
+                continue
+            gain = reroll_value - initial_value
+            if reroll_value < min_score or gain < min_gain:
+                continue
+            selected_positions.append(output_position)
+            selected_source_idxs.append(source_idx)
+            selected_gains.append(gain)
+            selected_weights.append(max_weight * float(np.clip(gain / gain_norm, 0.0, 1.0)))
+
+        if not selected_positions:
+            return None
+
+        nohint_batch = original_batch.select_idxs(selected_source_idxs)
+        reroll_rows = reroll_batch.select_idxs(selected_positions)
+        prompt_len = nohint_batch.batch["prompts"].shape[-1]
+
+        nohint_batch.batch["responses"] = reroll_rows.batch["responses"].clone()
+        for stale_key in ("rollout_log_probs", "rollout_is_weights"):
+            if stale_key in nohint_batch.batch:
+                nohint_batch.batch.pop(stale_key)
+        nohint_batch.batch["input_ids"] = torch.cat(
+            [nohint_batch.batch["prompts"], nohint_batch.batch["responses"]],
+            dim=-1,
+        )
+        prompt_attention_mask = nohint_batch.batch["attention_mask"][:, :prompt_len].clone()
+        reroll_response_mask = reroll_rows.batch.get("response_mask", None)
+        if reroll_response_mask is None:
+            reroll_response_mask = reroll_rows.batch["attention_mask"][:, prompt_len:]
+        nohint_batch.batch["attention_mask"] = torch.cat(
+            [prompt_attention_mask, reroll_response_mask.to(prompt_attention_mask.device)],
+            dim=-1,
+        )
+        new_position_ids = compute_position_id_with_mask(nohint_batch.batch["attention_mask"])
+        if nohint_batch.batch["position_ids"].dim() == 2:
+            nohint_batch.batch["position_ids"] = new_position_ids.to(
+                device=nohint_batch.batch["position_ids"].device,
+                dtype=nohint_batch.batch["position_ids"].dtype,
+            )
+        elif nohint_batch.batch["position_ids"].dim() == 3:
+            nohint_batch.batch["position_ids"] = (
+                new_position_ids.to(
+                    device=nohint_batch.batch["position_ids"].device,
+                    dtype=nohint_batch.batch["position_ids"].dtype,
+                )
+                .unsqueeze(1)
+                .expand_as(nohint_batch.batch["position_ids"])
+            )
+        nohint_batch.batch["response_mask"] = compute_response_mask(nohint_batch)
+
+        selected_score_result = self._select_gpt_rollout_result(reroll_score_result, selected_positions)
+        self._set_gpt_rollout_result(
+            batch=nohint_batch,
+            result=selected_score_result,
+            prefix="gpt_rollout",
+            threshold_100=threshold_100,
+        )
+        nohint_batch.non_tensor_batch["g_opd_sample_kind"] = np.full(len(nohint_batch), "reroll_nohint", dtype=object)
+        nohint_batch.non_tensor_batch["g_opd_loss_weight"] = np.array(selected_weights, dtype=np.float32)
+        nohint_batch.non_tensor_batch["g_opd_source_row_idx"] = np.array(selected_source_idxs, dtype=object)
+        nohint_batch.non_tensor_batch["g_opd_reroll_gain_100"] = np.array(selected_gains, dtype=np.float32)
+        nohint_batch.non_tensor_batch["gpt_rollout_reroll_count"] = np.ones(len(nohint_batch), dtype=object)
+        if "uid" in nohint_batch.non_tensor_batch:
+            nohint_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(nohint_batch))], dtype=object)
+        return nohint_batch
+
+    def _concat_training_batches(self, batches: list[DataProto]) -> DataProto:
+        batches = [batch for batch in batches if batch is not None and len(batch) > 0]
+        if len(batches) == 1:
+            return batches[0]
+
+        batch_key_sets = [set(batch.batch.keys()) for batch in batches if batch.batch is not None]
+        if batch_key_sets:
+            common_batch_keys = set.intersection(*batch_key_sets)
+            if any(keys != common_batch_keys for keys in batch_key_sets):
+                batches = [
+                    batch.select(
+                        batch_keys=list(common_batch_keys),
+                        non_tensor_batch_keys=list(batch.non_tensor_batch.keys()),
+                    )
+                    for batch in batches
+                ]
+
+        all_non_tensor_keys = set()
+        for batch in batches:
+            all_non_tensor_keys.update(batch.non_tensor_batch.keys())
+        for batch in batches:
+            for key in all_non_tensor_keys:
+                if key not in batch.non_tensor_batch:
+                    batch.non_tensor_batch[key] = np.full(len(batch), None, dtype=object)
+
+        return DataProto.concat(batches)
+
+    def _worker_group_dp_size(self, worker_group, mesh_name: str) -> int:
+        if worker_group is None:
+            return 1
+        try:
+            if mesh_name not in worker_group._dispatch_info:
+                worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+            dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+        except Exception as exc:
+            self._debug_progress(f"update_batch_pad:failed_to_query_dp_size mesh={mesh_name} error={exc}")
+            return 1
+        if not dp_rank_mapping:
+            return 1
+        return max(dp_rank_mapping) + 1
+
+    def _actor_critic_update_divisor(self) -> int:
+        divisor = self._worker_group_dp_size(self.actor_rollout_wg, "actor")
+        if self.use_critic:
+            critic_divisor = self._worker_group_dp_size(self.critic_wg, "critic")
+            divisor = math.lcm(max(divisor, 1), max(critic_divisor, 1))
+        return max(divisor, 1)
+
+    def _zero_padding_rows(self, batch: DataProto) -> None:
+        padding_flags = batch.non_tensor_batch.get("g_opd_padding_sample", None)
+        if padding_flags is None:
+            return
+        pad_idxs = np.where(np.array([bool(flag) for flag in padding_flags.tolist()], dtype=bool))[0]
+        if len(pad_idxs) == 0:
+            return
+        for key in ("response_mask", "advantages", "returns", "token_level_scores", "token_level_rewards"):
+            if key in batch.batch:
+                batch.batch[key][pad_idxs] = 0
+        if "values" in batch.batch:
+            batch.batch["values"][pad_idxs] = 0
+        if "loss_mask" in batch.batch:
+            batch.batch["loss_mask"][pad_idxs] = 0
+        if "g_opd_loss_weight" in batch.non_tensor_batch:
+            batch.non_tensor_batch["g_opd_loss_weight"][pad_idxs] = 0.0
+
+    def _pad_training_batch_to_update_divisor(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        *,
+        metric_prefix: str,
+        zero_training_signals: bool,
+    ) -> DataProto:
+        divisor = self._actor_critic_update_divisor()
+        remainder = len(batch) % divisor
+        pad_size = 0 if remainder == 0 else divisor - remainder
+        metrics[f"{metric_prefix}/original_size"] = len(batch)
+        metrics[f"{metric_prefix}/divisor"] = divisor
+        metrics[f"{metric_prefix}/pad_size"] = pad_size
+        if pad_size <= 0:
+            if zero_training_signals:
+                self._zero_padding_rows(batch)
+            return batch
+
+        padded_batch, actual_pad_size = pad_dataproto_to_divisor(batch, divisor)
+        pad_start = len(batch)
+        pad_idxs = np.arange(pad_start, pad_start + actual_pad_size, dtype=np.int64)
+
+        old_padding_flags = padded_batch.non_tensor_batch.get("g_opd_padding_sample", None)
+        padded_batch.non_tensor_batch["g_opd_padding_sample"] = np.full(len(padded_batch), False, dtype=object)
+        if old_padding_flags is not None:
+            padded_batch.non_tensor_batch["g_opd_padding_sample"][: len(old_padding_flags)] = old_padding_flags
+        padded_batch.non_tensor_batch["g_opd_padding_sample"][pad_idxs] = True
+        if "g_opd_loss_weight" not in padded_batch.non_tensor_batch:
+            padded_batch.non_tensor_batch["g_opd_loss_weight"] = np.full(len(padded_batch), 1.0, dtype=np.float32)
+        padded_batch.non_tensor_batch["g_opd_loss_weight"][pad_idxs] = 0.0
+        if "g_opd_sample_kind" in padded_batch.non_tensor_batch:
+            padded_batch.non_tensor_batch["g_opd_sample_kind"][pad_idxs] = "padding"
+        if "uid" in padded_batch.non_tensor_batch:
+            padded_batch.non_tensor_batch["uid"][pad_idxs] = np.array(
+                [f"padding-{self.global_steps}-{i}" for i in range(actual_pad_size)],
+                dtype=object,
+            )
+        if "response_mask" in padded_batch.batch:
+            padded_batch.batch["response_mask"][pad_idxs] = 0
+        if zero_training_signals:
+            self._zero_padding_rows(padded_batch)
+
+        padded_batch.meta_info.update(batch.meta_info)
+        metrics[f"{metric_prefix}/final_size"] = len(padded_batch)
+        self._debug_progress(
+            f"{metric_prefix}: padded size {len(batch)} -> {len(padded_batch)} "
+            f"divisor={divisor} pad={actual_pad_size} zero_training_signals={zero_training_signals}"
+        )
+        return padded_batch
+
+    def _rank_descending(self, values: list[float | None], eligible_mask: Optional[np.ndarray] = None) -> np.ndarray:
+        ranks = np.full(len(values), -1, dtype=np.int64)
+        if eligible_mask is None:
+            eligible_mask = np.ones(len(values), dtype=bool)
+        valid = [
+            (idx, float(value))
+            for idx, value in enumerate(values)
+            if eligible_mask[idx] and value is not None and np.isfinite(value)
+        ]
+        valid.sort(key=lambda item: item[1], reverse=True)
+        for rank, (idx, _) in enumerate(valid):
+            ranks[idx] = rank
+        return ranks
+
+    def _rank_gap_direction(self, teacher_rank: int, rubric_rank: int) -> str:
+        if teacher_rank < rubric_rank:
+            return "rubric_low_teacher_high"
+        if rubric_rank < teacher_rank:
+            return "rubric_high_teacher_low"
+        return "rank_tie"
+
+    def _rank_gap_entries(
+        self,
+        batch: DataProto,
+        *,
+        teacher_scores: list[float | None],
+        rubric_scores: list[float | None],
+        teacher_ranks: np.ndarray,
+        rubric_ranks: np.ndarray,
+        rank_gap: np.ndarray,
+        high_gap_mask: np.ndarray,
+        drop_mask: np.ndarray,
+        drop_threshold: float,
+    ) -> list[dict]:
+        entries = []
+        for idx in np.where(high_gap_mask)[0].tolist():
+            prompt_text, response_text = self._decode_rollout_prompt_response(batch=batch, idx=idx)
+            extra_info = self._get_non_tensor_row_value(batch, "extra_info", idx, {}) or {}
+            reward_model = self._get_non_tensor_row_value(batch, "reward_model", idx, {}) or {}
+            ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+            if ground_truth is None and isinstance(extra_info, dict):
+                ground_truth = extra_info.get("answer")
+            teacher_rank = int(teacher_ranks[idx])
+            rubric_rank = int(rubric_ranks[idx])
+            entries.append(
+                {
+                    "step": self.global_steps,
+                    "row_idx": int(idx),
+                    "direction": self._rank_gap_direction(teacher_rank, rubric_rank),
+                    "dropped": bool(drop_mask[idx]),
+                    "rank_gap": float(rank_gap[idx]),
+                    "drop_threshold": float(drop_threshold),
+                    "teacher_rank": teacher_rank,
+                    "rubric_rank": rubric_rank,
+                    "teacher_score": teacher_scores[idx],
+                    "rubric_score_100": rubric_scores[idx],
+                    "sample_kind": self._get_non_tensor_row_value(batch, "g_opd_sample_kind", idx, "orig"),
+                    "source_row_idx": self._get_non_tensor_row_value(batch, "g_opd_source_row_idx", idx, None),
+                    "reroll_count": self._get_non_tensor_row_value(batch, "gpt_rollout_reroll_count", idx, None),
+                    "reroll_gain_100": self._get_non_tensor_row_value(batch, "g_opd_reroll_gain_100", idx, None),
+                    "problem": extra_info.get("problem") if isinstance(extra_info, dict) else prompt_text,
+                    "ground_truth": ground_truth,
+                    "output": response_text,
+                    "gpt_weighted_score_1_to_4": self._get_non_tensor_row_value(
+                        batch,
+                        "gpt_rollout_weighted_score_1_to_4",
+                        idx,
+                        None,
+                    ),
+                    "gpt_revision_suggestion": self._get_non_tensor_row_value(
+                        batch,
+                        "gpt_rollout_revision_suggestion",
+                        idx,
+                        None,
+                    ),
+                    "gpt_revision_suggestion_source": self._get_non_tensor_row_value(
+                        batch,
+                        "gpt_rollout_revision_suggestion_source",
+                        idx,
+                        None,
+                    ),
+                    "gpt_rubric_scores": self._get_non_tensor_row_value(
+                        batch,
+                        "gpt_rollout_rubric_scores",
+                        idx,
+                        None,
+                    ),
+                    "data_source": self._get_non_tensor_row_value(batch, "data_source", idx, None),
+                    "request_id": self._get_non_tensor_row_value(batch, "request_id", idx, None),
+                    "uid": self._get_non_tensor_row_value(batch, "uid", idx, None),
+                    "extra_info": extra_info,
+                    "reward_model": reward_model,
+                }
+            )
+        return entries
+
+    def _maybe_dump_rank_gap_examples(
+        self,
+        *,
+        scorer_config: dict,
+        entries: list[dict],
+        timing_raw: Optional[dict],
+    ) -> None:
+        if not entries:
+            return
+        dump_dir = scorer_config.get("rank_gap_case_study_dir", None)
+        if not dump_dir or str(dump_dir).strip().lower() in {"none", "null", "false", "0"}:
+            dump_dir = scorer_config.get("case_study_dir", None)
+        if not dump_dir or str(dump_dir).strip().lower() in {"none", "null", "false", "0"}:
+            return
+
+        filename = os.path.join(str(dump_dir), "rank_gap", f"{self.global_steps}.jsonl")
+        if timing_raw is None:
+            self._write_rows_to_jsonl(entries, filename)
+        else:
+            with marked_timer("dump_rank_gap_cases", timing_raw, color="green"):
+                self._write_rows_to_jsonl(entries, filename)
+        self._debug_progress(f"rank_gap_case_study:dumped count={len(entries)} file={filename}")
+
+    def _rank_gap_drop_and_rubric_shift(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        timing_raw: Optional[dict] = None,
+    ) -> DataProto:
+        scorer_config = self.config.trainer.get("gpt_rollout_score", None)
+        if not scorer_config or not _is_truthy(scorer_config.get("enable", False)):
+            return batch
+        if "gpt_rollout_score_100" not in batch.non_tensor_batch:
+            return batch
+        if "old_log_probs" not in batch.batch or "ref_log_prob" not in batch.batch:
+            return batch
+
+        response_mask = batch.batch["response_mask"]
+        token_counts = response_mask.sum(dim=-1).clamp_min(1.0)
+        teacher_scores = (
+            ((batch.batch["ref_log_prob"] - batch.batch["old_log_probs"]) * response_mask).sum(dim=-1)
+            / token_counts
+        ).detach().cpu().tolist()
+        rubric_scores = [
+            self._finite_gpt_score_value(score)
+            for score in batch.non_tensor_batch["gpt_rollout_score_100"].tolist()
+        ]
+        padding_flags = batch.non_tensor_batch.get("g_opd_padding_sample", None)
+        if padding_flags is None:
+            non_padding_mask = np.ones(len(batch), dtype=bool)
+        else:
+            non_padding_mask = ~np.array([bool(flag) for flag in padding_flags.tolist()], dtype=bool)
+        teacher_ranks = self._rank_descending(teacher_scores, eligible_mask=non_padding_mask)
+        rubric_ranks = self._rank_descending(rubric_scores, eligible_mask=non_padding_mask)
+        valid_mask = (teacher_ranks >= 0) & (rubric_ranks >= 0) & non_padding_mask
+        valid_count = int(valid_mask.sum())
+        if valid_count <= 0:
+            return batch
+
+        rank_gap = np.zeros(len(batch), dtype=np.float32)
+        denominator = max(valid_count - 1, 1)
+        rank_gap[valid_mask] = np.abs(teacher_ranks[valid_mask] - rubric_ranks[valid_mask]).astype(np.float32) / denominator
+        batch.non_tensor_batch["g_opd_teacher_rank"] = teacher_ranks.astype(object)
+        batch.non_tensor_batch["g_opd_rubric_rank"] = rubric_ranks.astype(object)
+        batch.non_tensor_batch["g_opd_teacher_rubric_rank_gap"] = rank_gap.astype(object)
+
+        drop_enable = _is_truthy(scorer_config.get("rank_gap_drop_enable", False))
+        drop_threshold = float(scorer_config.get("rank_gap_drop_threshold", 1.1))
+        drop_scope = str(scorer_config.get("rank_gap_drop_scope", "all")).strip().lower()
+        if drop_scope not in {"appended", "all"}:
+            drop_scope = "all"
+        keep_mask = np.ones(len(batch), dtype=bool)
+        high_gap_mask = valid_mask & (rank_gap > drop_threshold)
+        rubric_low_teacher_high_mask = high_gap_mask & (teacher_ranks < rubric_ranks)
+        rubric_high_teacher_low_mask = high_gap_mask & (rubric_ranks < teacher_ranks)
+        metrics["g_opd_rank_gap_drop/rubric_low_teacher_high_count"] = int(rubric_low_teacher_high_mask.sum())
+        metrics["g_opd_rank_gap_drop/rubric_high_teacher_low_count"] = int(rubric_high_teacher_low_mask.sum())
+        metrics["g_opd_rank_gap_drop/high_gap_count"] = int(high_gap_mask.sum())
+        rank_gap_entries = []
+        if drop_enable:
+            drop_candidate_mask = np.ones(len(batch), dtype=bool)
+            sample_kinds = batch.non_tensor_batch.get("g_opd_sample_kind", None)
+            if drop_scope == "appended":
+                if sample_kinds is None:
+                    drop_candidate_mask = np.zeros(len(batch), dtype=bool)
+                else:
+                    drop_candidate_mask = np.array(
+                        [str(kind or "orig") != "orig" for kind in sample_kinds.tolist()],
+                        dtype=bool,
+                    )
+            drop_mask = high_gap_mask & drop_candidate_mask
+            protected_orig_count = int((high_gap_mask & ~drop_candidate_mask).sum())
+            keep_mask = ~drop_mask
+            if not keep_mask.any():
+                best_rubric_idx = int(np.argmin(np.where(rubric_ranks >= 0, rubric_ranks, len(batch) + 1)))
+                keep_mask[best_rubric_idx] = True
+                drop_mask[best_rubric_idx] = False
+            dropped = int((~keep_mask).sum())
+            metrics["g_opd_rank_gap_drop/dropped_count"] = dropped
+            metrics["g_opd_rank_gap_drop/drop_threshold"] = drop_threshold
+            metrics["g_opd_rank_gap_drop/scope_appended"] = 1 if drop_scope == "appended" else 0
+            metrics["g_opd_rank_gap_drop/scope_all"] = 1 if drop_scope == "all" else 0
+            metrics["g_opd_rank_gap_drop/protected_orig_count"] = protected_orig_count
+            metrics["g_opd_rank_gap_drop/dropped_rubric_low_teacher_high_count"] = int(
+                (drop_mask & rubric_low_teacher_high_mask).sum()
+            )
+            metrics["g_opd_rank_gap_drop/dropped_rubric_high_teacher_low_count"] = int(
+                (drop_mask & rubric_high_teacher_low_mask).sum()
+            )
+            metrics["gpt_rollout_reroll/protected_orig_from_rank_drop_count"] = protected_orig_count
+            rank_gap_entries = self._rank_gap_entries(
+                batch,
+                teacher_scores=teacher_scores,
+                rubric_scores=rubric_scores,
+                teacher_ranks=teacher_ranks,
+                rubric_ranks=rubric_ranks,
+                rank_gap=rank_gap,
+                high_gap_mask=high_gap_mask,
+                drop_mask=drop_mask,
+                drop_threshold=drop_threshold,
+            )
+            self._maybe_dump_rank_gap_examples(
+                scorer_config=scorer_config,
+                entries=rank_gap_entries,
+                timing_raw=timing_raw,
+            )
+            if dropped:
+                batch = batch.select_idxs(keep_mask)
+                teacher_scores = [value for keep, value in zip(keep_mask, teacher_scores) if keep]
+                rubric_scores = [value for keep, value in zip(keep_mask, rubric_scores) if keep]
+                padding_flags = batch.non_tensor_batch.get("g_opd_padding_sample", None)
+                if padding_flags is None:
+                    non_padding_mask = np.ones(len(batch), dtype=bool)
+                else:
+                    non_padding_mask = ~np.array([bool(flag) for flag in padding_flags.tolist()], dtype=bool)
+                teacher_ranks = self._rank_descending(teacher_scores, eligible_mask=non_padding_mask)
+                rubric_ranks = self._rank_descending(rubric_scores, eligible_mask=non_padding_mask)
+                valid_mask = (teacher_ranks >= 0) & (rubric_ranks >= 0) & non_padding_mask
+                valid_count = int(valid_mask.sum())
+                rank_gap = np.zeros(len(batch), dtype=np.float32)
+                denominator = max(valid_count - 1, 1)
+                rank_gap[valid_mask] = (
+                    np.abs(teacher_ranks[valid_mask] - rubric_ranks[valid_mask]).astype(np.float32) / denominator
+                )
+                batch.non_tensor_batch["g_opd_teacher_rank"] = teacher_ranks.astype(object)
+                batch.non_tensor_batch["g_opd_rubric_rank"] = rubric_ranks.astype(object)
+                batch.non_tensor_batch["g_opd_teacher_rubric_rank_gap"] = rank_gap.astype(object)
+        elif int(high_gap_mask.sum()) > 0:
+            drop_mask = np.zeros(len(batch), dtype=bool)
+            rank_gap_entries = self._rank_gap_entries(
+                batch,
+                teacher_scores=teacher_scores,
+                rubric_scores=rubric_scores,
+                teacher_ranks=teacher_ranks,
+                rubric_ranks=rubric_ranks,
+                rank_gap=rank_gap,
+                high_gap_mask=high_gap_mask,
+                drop_mask=drop_mask,
+                drop_threshold=drop_threshold,
+            )
+            self._maybe_dump_rank_gap_examples(
+                scorer_config=scorer_config,
+                entries=rank_gap_entries,
+                timing_raw=timing_raw,
+            )
+
+        shift_enable = _is_truthy(scorer_config.get("rubric_adv_shift_enable", False))
+        shift = np.zeros(len(batch), dtype=np.float32)
+        if shift_enable and valid_count > 0:
+            mode = str(scorer_config.get("rubric_adv_shift_mode", "rank_residual")).strip().lower()
+            if mode not in {"rank_residual", "rubric_rank"}:
+                mode = "rank_residual"
+            coef = float(scorer_config.get("rubric_adv_shift_coef", 0.10))
+            clip = abs(float(scorer_config.get("rubric_adv_shift_clip", 0.20)))
+            denominator = max(valid_count - 1, 1)
+            raw_shift = np.zeros(len(batch), dtype=np.float32)
+            if mode == "rubric_rank":
+                centered = np.zeros(len(batch), dtype=np.float32)
+                centered[valid_mask] = 0.5 - (rubric_ranks[valid_mask].astype(np.float32) / denominator)
+                raw_shift = 2.0 * coef * centered
+            else:
+                # Correct teacher preference only when rubric ranks the sample differently.
+                raw_shift[valid_mask] = (
+                    coef
+                    * (teacher_ranks[valid_mask].astype(np.float32) - rubric_ranks[valid_mask].astype(np.float32))
+                    / denominator
+                )
+            shift = np.clip(raw_shift, -clip, clip).astype(np.float32)
+            metrics["g_opd_rubric_adv_shift/coef"] = coef
+            metrics["g_opd_rubric_adv_shift/clip"] = clip
+            metrics["g_opd_rubric_adv_shift/mode_rank_residual"] = 1 if mode == "rank_residual" else 0
+            metrics["g_opd_rubric_adv_shift/mode_rubric_rank"] = 1 if mode == "rubric_rank" else 0
+            metrics["g_opd_rubric_adv_shift/mean"] = float(np.mean(shift[valid_mask]))
+            metrics["g_opd_rubric_adv_shift/max_abs"] = float(np.max(np.abs(shift[valid_mask])))
+            metrics["g_opd_rubric_adv_shift/positive_count"] = int((shift[valid_mask] > 0).sum())
+            metrics["g_opd_rubric_adv_shift/negative_count"] = int((shift[valid_mask] < 0).sum())
+
+        batch.non_tensor_batch["opd_rubric_adv_shift"] = shift.astype(np.float32)
+        if len(rank_gap) > 0:
+            metrics["g_opd_teacher_rubric_rank_gap/mean"] = float(np.mean(rank_gap))
+            metrics["g_opd_teacher_rubric_rank_gap/max"] = float(np.max(rank_gap))
+        return batch
+
     def _set_standard_opd_teacher_inputs(self, batch: DataProto) -> None:
         batch.batch["ref_input_ids"] = batch.batch["input_ids"].clone()
         batch.batch["ref_attention_mask"] = batch.batch["attention_mask"].clone()
@@ -1404,15 +2115,20 @@ class RayPPOTrainer:
         initial_score_result: dict | None,
         metrics: dict,
         timing_raw: dict,
-    ) -> None:
+    ) -> DataProto:
         scorer_config = self.config.trainer.get("gpt_rollout_score", None)
         if not scorer_config or not _is_truthy(scorer_config.get("enable", False)) or initial_score_result is None:
-            return
+            self._ensure_g_opd_sample_metadata(batch, kind="orig", loss_weight=1.0)
+            return batch
 
         threshold_100 = float(scorer_config.get("min_score_100", 50.0))
         configured_max_attempts = int(scorer_config.get("max_rerollout_attempts", 1))
         max_attempts = min(max(configured_max_attempts, 0), 1)
+        orig_loss_weight = float(scorer_config.get("orig_loss_weight", 1.0))
+        reroll_hint_loss_weight = float(scorer_config.get("reroll_hint_loss_weight", 0.5))
+        self._ensure_g_opd_sample_metadata(batch, kind="orig", loss_weight=orig_loss_weight)
         reroll_counts = np.zeros(len(batch), dtype=object)
+        batch.non_tensor_batch["gpt_rollout_reroll_count"] = reroll_counts
         raw_low_idxs = self._get_low_gpt_score_idxs(initial_score_result["scores_100"], threshold_100)
         initial_timeout_idxs = self._get_initial_gpt_timeout_idxs(initial_score_result)
         initial_timeout_idx_set = set(initial_timeout_idxs)
@@ -1429,6 +2145,7 @@ class RayPPOTrainer:
         metrics["gpt_rollout_reroll/configured_max_attempts"] = configured_max_attempts
 
         gen_batch_for_reroll = None
+        appended_batches: list[DataProto] = []
         for attempt in range(max_attempts):
             if not low_idxs:
                 break
@@ -1437,14 +2154,24 @@ class RayPPOTrainer:
                 gen_batch_for_reroll = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-                feedback_count = self._append_gpt_feedback_to_reroll_prompts(
+                prompt_ready_idxs, prompt_hint_fallback_count = self._append_gpt_feedback_to_reroll_prompts(
                     batch=batch,
                     gen_batch=gen_batch_for_reroll,
                     row_idxs=low_idxs,
                     initial_score_result=initial_score_result,
                     scorer_config=scorer_config,
                 )
-                metrics["gpt_rollout_reroll/feedback_prompt_count"] = feedback_count
+                metrics["gpt_rollout_reroll/feedback_prompt_count"] = len(prompt_ready_idxs)
+                metrics["gpt_rollout_reroll/prompt_hint_fallback_count"] = prompt_hint_fallback_count
+                skipped_no_suggestion_count = len(low_idxs) - len(prompt_ready_idxs)
+                metrics["gpt_rollout_reroll/skipped_no_revision_suggestion_count"] = skipped_no_suggestion_count
+                if skipped_no_suggestion_count:
+                    self._debug_progress(
+                        f"gpt_reroll:skip_no_revision_suggestion count={skipped_no_suggestion_count}"
+                    )
+                low_idxs = prompt_ready_idxs
+                if not low_idxs:
+                    break
             reroll_gen_batch = gen_batch_for_reroll.select_idxs(low_idxs)
             self._debug_progress(f"gpt_reroll_generate:start attempt={attempt + 1}/{max_attempts} count={len(low_idxs)}")
             with marked_timer(f"gpt_reroll_gen_{attempt + 1}", timing_raw, color="red"):
@@ -1465,12 +2192,14 @@ class RayPPOTrainer:
             )
             reroll_scoring_batch.batch["response_mask"] = compute_response_mask(reroll_scoring_batch)
 
+            reroll_scorer_config = self._reroll_gpt_scorer_config(scorer_config)
             self._debug_progress(
-                f"gpt_reroll_rescore:start attempt={attempt + 1}/{max_attempts} count={len(low_idxs)}"
+                f"gpt_reroll_rescore:start attempt={attempt + 1}/{max_attempts} count={len(low_idxs)} "
+                f"max_output_tokens={reroll_scorer_config.get('max_output_tokens', '?')}"
             )
             reroll_score_result = self._score_gpt_rollouts(
                 batch=reroll_scoring_batch,
-                scorer_config=scorer_config,
+                scorer_config=reroll_scorer_config,
                 timing_raw=timing_raw,
                 timer_name=f"gpt_reroll_score_{attempt + 1}",
             )
@@ -1478,18 +2207,15 @@ class RayPPOTrainer:
                 f"gpt_reroll_rescore:done attempt={attempt + 1}/{max_attempts} count={len(low_idxs)}"
             )
 
-            accepted_output_positions = []
-            accepted_batch_idxs = []
-            rejected_batch_idxs = []
+            append_output_positions = []
+            append_batch_idxs = []
+            invalid_batch_idxs = []
             for output_position, idx in enumerate(low_idxs):
-                if self._is_reroll_score_better(
-                    reroll_score_result["scores_100"][output_position],
-                    initial_score_result["scores_100"][idx],
-                ):
-                    accepted_output_positions.append(output_position)
-                    accepted_batch_idxs.append(idx)
+                if self._finite_gpt_score_value(reroll_score_result["scores_100"][output_position]) is not None:
+                    append_output_positions.append(output_position)
+                    append_batch_idxs.append(idx)
                     continue
-                rejected_batch_idxs.append(idx)
+                invalid_batch_idxs.append(idx)
 
             self._maybe_record_gpt_case_study_reroll_attempts(
                 initial_score_result=initial_score_result,
@@ -1497,41 +2223,59 @@ class RayPPOTrainer:
                 reroll_scoring_batch=reroll_scoring_batch,
                 reroll_score_result=reroll_score_result,
                 row_idxs=low_idxs,
-                accepted_batch_idxs=accepted_batch_idxs,
+                accepted_batch_idxs=append_batch_idxs,
                 attempt=attempt,
             )
 
-            if accepted_batch_idxs:
-                accepted_reroll_output = reroll_output.select_idxs(accepted_output_positions)
-                self._replace_rollout_rows(
-                    batch=batch,
-                    rollout_output=accepted_reroll_output,
-                    row_idxs=accepted_batch_idxs,
-                )
-                accepted_score_result = self._select_gpt_rollout_result(
+            if append_batch_idxs:
+                appended_batch = reroll_scoring_batch.select_idxs(append_output_positions)
+                appended_score_result = self._select_gpt_rollout_result(
                     reroll_score_result,
-                    accepted_output_positions,
+                    append_output_positions,
                 )
                 self._set_gpt_rollout_result(
-                    batch=batch,
-                    result=accepted_score_result,
+                    batch=appended_batch,
+                    result=appended_score_result,
                     prefix="gpt_rollout",
                     threshold_100=threshold_100,
-                    row_idxs=accepted_batch_idxs,
                 )
-                batch.batch["response_mask"] = compute_response_mask(batch)
+                self._set_reroll_sample_metadata(
+                    batch=appended_batch,
+                    source_row_idxs=append_batch_idxs,
+                    initial_score_result=initial_score_result,
+                    reroll_score_result=appended_score_result,
+                    loss_weight=reroll_hint_loss_weight,
+                )
+                appended_batches.append(appended_batch)
+                nohint_batch = self._build_reroll_nohint_batch(
+                    original_batch=batch,
+                    reroll_batch=appended_batch,
+                    source_row_idxs=append_batch_idxs,
+                    initial_score_result=initial_score_result,
+                    reroll_score_result=appended_score_result,
+                    scorer_config=scorer_config,
+                    threshold_100=threshold_100,
+                )
+                if nohint_batch is not None:
+                    appended_batches.append(nohint_batch)
+                    metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_nohint_count"] = len(nohint_batch)
 
-            for idx in accepted_batch_idxs:
+            for idx in append_batch_idxs:
                 reroll_counts[idx] = int(reroll_counts[idx]) + 1
 
             reroll_valid_count = sum(score is not None for score in reroll_score_result["scores_100"])
-            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_generated_count"] = len(low_idxs)
+            second_rollout_count = len(low_idxs)
+            second_append_rate = len(append_batch_idxs) / second_rollout_count if second_rollout_count > 0 else 0.0
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_generated_count"] = second_rollout_count
             metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rescore_valid_count"] = reroll_valid_count
-            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rerolled_count"] = len(accepted_batch_idxs)
-            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rejected_count"] = len(rejected_batch_idxs)
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_appended_count"] = len(append_batch_idxs)
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_append_rate"] = second_append_rate
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_invalid_score_count"] = len(invalid_batch_idxs)
+            metrics["gpt_rollout_reroll/second_append_rate"] = second_append_rate
             self._debug_progress(
                 f"gpt_reroll_select:done attempt={attempt + 1}/{max_attempts} "
-                f"accepted={len(accepted_batch_idxs)} rejected={len(rejected_batch_idxs)}"
+                f"appended={len(append_batch_idxs)} "
+                f"invalid_score={len(invalid_batch_idxs)}"
             )
             low_idxs = []
 
@@ -1559,12 +2303,27 @@ class RayPPOTrainer:
         metrics["gpt_rollout_reroll/final_low_count"] = len(final_low_idxs)
         metrics["gpt_rollout_reroll/rerolled_count"] = int(sum(int(count) > 0 for count in reroll_counts))
         metrics["gpt_rollout_reroll/total_rerolls"] = int(sum(int(count) for count in reroll_counts))
+        sample_kind_counts = defaultdict(int)
+        for appended_batch in appended_batches:
+            kinds = appended_batch.non_tensor_batch.get("g_opd_sample_kind")
+            if kinds is None:
+                continue
+            for kind in kinds.tolist():
+                sample_kind_counts[str(kind)] += 1
+        metrics["gpt_rollout_reroll/appended_count"] = int(sum(sample_kind_counts.values()))
+        metrics["gpt_rollout_reroll/appended_hint_count"] = int(sample_kind_counts.get("reroll_hint", 0))
+        metrics["gpt_rollout_reroll/appended_nohint_count"] = int(sample_kind_counts.get("reroll_nohint", 0))
+        metrics["gpt_rollout_reroll/orig_count"] = len(batch)
         metrics["gpt_rollout_reroll/rescore_skipped_count"] = 0
         self._debug_progress(
             f"gpt_reroll:done final_low_count={len(final_low_idxs)} "
-            f"accepted_rerolls={metrics['gpt_rollout_reroll/total_rerolls']} "
+            f"appended={metrics['gpt_rollout_reroll/appended_count']} "
             f"rescore_skipped_count={metrics['gpt_rollout_reroll/rescore_skipped_count']}"
         )
+        if appended_batches:
+            batch = self._concat_training_batches([batch] + appended_batches)
+            metrics["gpt_rollout_reroll/final_train_batch_size"] = len(batch)
+        return batch
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1755,9 +2514,9 @@ class RayPPOTrainer:
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+            metric_dict["val-aux/num_turns/min"] = float(sample_turns.min())
+            metric_dict["val-aux/num_turns/max"] = float(sample_turns.max())
+            metric_dict["val-aux/num_turns/mean"] = float(sample_turns.mean())
 
         return metric_dict
 
@@ -2076,7 +2835,14 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            val_log_metrics, dropped_val_metrics = _sanitize_metrics_for_logging(val_metrics)
+            if dropped_val_metrics:
+                preview = ", ".join(f"{key}:{reason}" for key, reason in dropped_val_metrics[:8])
+                self._debug_progress(
+                    f"val_metrics_log:sanitized kept={len(val_log_metrics)} "
+                    f"dropped={len(dropped_val_metrics)} dropped_preview={preview}"
+                )
+            logger.log(data=val_log_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -2185,12 +2951,19 @@ class RayPPOTrainer:
                     self._debug_progress(f"batch_prepare:done rollout_batch_size={len(batch)}")
 
                     gpt_score_result = self._maybe_score_gpt_rollouts(batch=batch, metrics=metrics, timing_raw=timing_raw)
-                    self._maybe_reroll_low_gpt_rollouts(
+                    batch = self._maybe_reroll_low_gpt_rollouts(
                         batch=batch,
                         gen_batch=gen_batch,
                         initial_score_result=gpt_score_result,
                         metrics=metrics,
                         timing_raw=timing_raw,
+                    )
+                    batch.batch["response_mask"] = compute_response_mask(batch)
+                    batch = self._pad_training_batch_to_update_divisor(
+                        batch=batch,
+                        metrics=metrics,
+                        metric_prefix="g_opd_pre_balance_batch",
+                        zero_training_signals=False,
                     )
 
                     # Balance the number of valid tokens across DP ranks.
@@ -2221,9 +2994,9 @@ class RayPPOTrainer:
                     self._debug_progress("reward:done")
 
                     # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: 蟺_rollout, 蟺_胃)
+                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: 蟺_rollout, 蟺_old, 蟺_胃)
+                    #   Note: 蟺_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
@@ -2393,6 +3166,31 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        batch = self._rank_gap_drop_and_rubric_shift(
+                            batch=batch,
+                            metrics=metrics,
+                            timing_raw=timing_raw,
+                        )
+                        batch = self._pad_training_batch_to_update_divisor(
+                            batch=batch,
+                            metrics=metrics,
+                            metric_prefix="g_opd_update_batch",
+                            zero_training_signals=True,
+                        )
+                        if reward_extra_infos_dict:
+                            reward_extra_infos_dict = {
+                                key: batch.non_tensor_batch[key].tolist()
+                                for key in reward_extra_infos_dict
+                                if key in batch.non_tensor_batch
+                            }
+
+                        self._maybe_update_gpt_case_study_rule_scores(
+                            batch=batch,
+                            initial_score_result=gpt_score_result,
+                            reward_extra_infos_dict=reward_extra_infos_dict,
+                            timing_raw=timing_raw,
+                        )
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -2403,8 +3201,8 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # Only runs in decoupled mode (computes once per batch using stable 蟺_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving 蟺_胃 vs 蟺_rollout
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -2431,6 +3229,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        self._zero_padding_rows(batch)
                     self._debug_progress("advantage:done")
 
                     # update critic
@@ -2536,7 +3335,16 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 self._debug_progress("metrics_log:start")
-                logger.log(data=metrics, step=self.global_steps)
+                log_metrics, dropped_log_metrics = _sanitize_metrics_for_logging(metrics)
+                if dropped_log_metrics:
+                    preview = ", ".join(f"{key}:{reason}" for key, reason in dropped_log_metrics[:8])
+                    self._debug_progress(
+                        f"metrics_log:sanitized kept={len(log_metrics)} dropped={len(dropped_log_metrics)} "
+                        f"dropped_preview={preview}"
+                    )
+                else:
+                    self._debug_progress(f"metrics_log:sanitized kept={len(log_metrics)} dropped=0")
+                logger.log(data=log_metrics, step=self.global_steps)
                 self._debug_progress("metrics_log:done")
 
                 progress_bar.update(1)
@@ -2560,5 +3368,3 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
-
-
