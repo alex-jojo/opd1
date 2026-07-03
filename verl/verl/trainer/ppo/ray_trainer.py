@@ -32,10 +32,11 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import math
 import os
+import hashlib
 import time
 import uuid
 import zipfile
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -414,6 +415,8 @@ class RayPPOTrainer:
             print(f"  Actor base model: {self.base_model_path}")
             print(f"  Ref base model: {self.ref_base_model_path}")
 
+        self._gpt_rubric_history: deque[dict[str, object]] = deque()
+
                 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -600,6 +603,7 @@ class RayPPOTrainer:
                 "gpt_rollout_reroll_count",
                 "g_opd_sample_kind",
                 "g_opd_loss_weight",
+                "g_opd_reroll_sft_weight",
                 "g_opd_source_row_idx",
                 "g_opd_reroll_gain_100",
                 "g_opd_teacher_rank",
@@ -841,6 +845,8 @@ class RayPPOTrainer:
                     "second_score_delta_100": None,
                     "gpt_reason": result["reasons"][idx],
                     "gpt_revision_suggestion": result["revision_suggestions"][idx],
+                    "gpt_problem_domain": result.get("problem_domains", [None for _ in result["scores_100"]])[idx],
+                    "gpt_difficulty_3": result.get("difficulty_3", [None for _ in result["scores_100"]])[idx],
                     "gpt_error": result["errors"][idx],
                     "threshold_100": threshold_100,
                     "data_source": self._get_non_tensor_row_value(batch, "data_source", idx, None),
@@ -896,6 +902,7 @@ class RayPPOTrainer:
         reroll_score_result: dict,
         row_idxs: list[int],
         accepted_batch_idxs: list[int],
+        rejected_reasons: Optional[dict[int, str]],
         attempt: int,
     ) -> None:
         entries = initial_score_result.get("_case_study_entries")
@@ -932,9 +939,10 @@ class RayPPOTrainer:
                 score_delta_100 = second_score_value - initial_score_value
 
             accepted = int(idx) in accepted_idx_set
-            rejected_reason = None
-            if not accepted:
-                rejected_reason = "reroll_score_invalid" if second_score_value is None else "score_not_better"
+            rejected_reason = None if accepted else (rejected_reasons or {}).get(
+                int(idx),
+                "reroll_score_invalid" if second_score_value is None else "reroll_selection_rejected",
+            )
 
             entry.update(
                 {
@@ -957,6 +965,12 @@ class RayPPOTrainer:
                     "second_gpt_revision_suggestion": reroll_score_result[
                         "revision_suggestions"
                     ][output_position],
+                    "second_gpt_problem_domain": reroll_score_result.get(
+                        "problem_domains", [None for _ in reroll_score_result["scores_100"]]
+                    )[output_position],
+                    "second_gpt_difficulty_3": reroll_score_result.get(
+                        "difficulty_3", [None for _ in reroll_score_result["scores_100"]]
+                    )[output_position],
                     "second_gpt_error": reroll_score_result["errors"][output_position],
                 }
             )
@@ -1069,12 +1083,30 @@ class RayPPOTrainer:
             f"{prefix}_rubric_scores": result["rubric_scores"],
             f"{prefix}_reason": result["reasons"],
             f"{prefix}_revision_suggestion": result["revision_suggestions"],
+            f"{prefix}_problem_domain": result.get("problem_domains", [None for _ in result["scores"]]),
+            f"{prefix}_difficulty_3": result.get("difficulty_3", [None for _ in result["scores"]]),
             f"{prefix}_error": result["errors"],
             f"{prefix}_model": result["models"],
         }
         if "revision_suggestion_sources" in result:
             values[f"{prefix}_revision_suggestion_source"] = result["revision_suggestion_sources"]
         return values
+
+    def _inherit_gpt_problem_labels(
+        self,
+        *,
+        target_result: dict,
+        source_result: dict,
+        source_row_idxs: list[int],
+    ) -> None:
+        source_domains = source_result.get("problem_domains", [])
+        source_difficulties = source_result.get("difficulty_3", [])
+        target_result["problem_domains"] = [
+            source_domains[idx] if idx < len(source_domains) else None for idx in source_row_idxs
+        ]
+        target_result["difficulty_3"] = [
+            source_difficulties[idx] if idx < len(source_difficulties) else None for idx in source_row_idxs
+        ]
 
     def _get_gpt_rollout_pass_flags(self, scores_100: list, threshold_100: float) -> list[bool]:
         pass_flags = []
@@ -1562,6 +1594,7 @@ class RayPPOTrainer:
         defaults = {
             "g_opd_sample_kind": np.full(n, kind, dtype=object),
             "g_opd_loss_weight": np.full(n, float(loss_weight), dtype=np.float32),
+            "g_opd_reroll_sft_weight": np.zeros(n, dtype=np.float32),
             "g_opd_source_row_idx": np.arange(n, dtype=object),
             "g_opd_reroll_gain_100": np.zeros(n, dtype=np.float32),
             "gpt_rollout_reroll_count": np.zeros(n, dtype=object),
@@ -1590,6 +1623,7 @@ class RayPPOTrainer:
 
         batch.non_tensor_batch["g_opd_sample_kind"] = np.full(n, "reroll_hint", dtype=object)
         batch.non_tensor_batch["g_opd_loss_weight"] = np.full(n, float(loss_weight), dtype=np.float32)
+        batch.non_tensor_batch["g_opd_reroll_sft_weight"] = np.zeros(n, dtype=np.float32)
         batch.non_tensor_batch["g_opd_source_row_idx"] = np.array(source_row_idxs, dtype=object)
         batch.non_tensor_batch["g_opd_reroll_gain_100"] = np.array(gains, dtype=np.float32)
         batch.non_tensor_batch["gpt_rollout_reroll_count"] = np.ones(n, dtype=object)
@@ -1681,12 +1715,148 @@ class RayPPOTrainer:
         )
         nohint_batch.non_tensor_batch["g_opd_sample_kind"] = np.full(len(nohint_batch), "reroll_nohint", dtype=object)
         nohint_batch.non_tensor_batch["g_opd_loss_weight"] = np.array(selected_weights, dtype=np.float32)
+        nohint_batch.non_tensor_batch["g_opd_reroll_sft_weight"] = np.zeros(len(nohint_batch), dtype=np.float32)
         nohint_batch.non_tensor_batch["g_opd_source_row_idx"] = np.array(selected_source_idxs, dtype=object)
         nohint_batch.non_tensor_batch["g_opd_reroll_gain_100"] = np.array(selected_gains, dtype=np.float32)
         nohint_batch.non_tensor_batch["gpt_rollout_reroll_count"] = np.ones(len(nohint_batch), dtype=object)
         if "uid" in nohint_batch.non_tensor_batch:
             nohint_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(nohint_batch))], dtype=object)
         return nohint_batch
+
+    def _reroll_sft_weighted_scores(
+        self,
+        *,
+        initial_score_result: dict,
+        reroll_score_result: dict,
+        source_row_idxs: list[int],
+        scorer_config: dict,
+    ) -> list[float]:
+        score_coef = float(scorer_config.get("reroll_sft_score_coef", 1.0))
+        gain_coef = float(scorer_config.get("reroll_sft_gain_coef", 0.0))
+        rewards = []
+        for output_position, source_idx in enumerate(source_row_idxs):
+            reroll_value = self._finite_gpt_score_value(reroll_score_result["scores_100"][output_position])
+            initial_value = self._finite_gpt_score_value(initial_score_result["scores_100"][source_idx])
+            if reroll_value is None:
+                rewards.append(float("nan"))
+                continue
+            gain_value = 0.0 if initial_value is None else reroll_value - initial_value
+            reward = (score_coef * reroll_value + gain_coef * gain_value) / 100.0
+            rewards.append(float(reward))
+        return rewards
+
+    def _compute_reroll_sft_weights(self, rewards: list[float], scorer_config: dict) -> np.ndarray:
+        rewards_array = np.array(rewards, dtype=np.float32)
+        finite_mask = np.isfinite(rewards_array)
+        weights = np.zeros_like(rewards_array, dtype=np.float32)
+        if not finite_mask.any():
+            return weights
+
+        alpha = float(scorer_config.get("reroll_sft_alpha", 1.0))
+        z_clip = abs(float(scorer_config.get("reroll_sft_z_clip", 2.0)))
+        weight_min = max(0.0, float(scorer_config.get("reroll_sft_weight_min", 0.1)))
+        weight_max = max(weight_min, float(scorer_config.get("reroll_sft_weight_max", 4.0)))
+        lambda_weight = max(0.0, float(scorer_config.get("reroll_sft_lambda", 0.3)))
+        normalize = _is_truthy(scorer_config.get("reroll_sft_normalize_weights", True))
+        std_floor = max(float(scorer_config.get("reroll_sft_std_floor", 1e-6)), 1e-6)
+
+        valid_rewards = rewards_array[finite_mask]
+        mean = float(np.mean(valid_rewards))
+        std = max(float(np.std(valid_rewards)), std_floor)
+        z_scores = np.clip((rewards_array - mean) / std, -z_clip, z_clip)
+        raw_weights = np.exp(alpha * z_scores).astype(np.float32)
+        raw_weights = np.clip(raw_weights, weight_min, weight_max)
+        if normalize:
+            mean_weight = float(np.mean(raw_weights[finite_mask]))
+            if np.isfinite(mean_weight) and mean_weight > 1e-8:
+                raw_weights = raw_weights / mean_weight
+        weights[finite_mask] = raw_weights[finite_mask] * lambda_weight
+        return weights.astype(np.float32)
+
+    def _build_reroll_sft_batch(
+        self,
+        *,
+        original_batch: DataProto,
+        reroll_batch: DataProto,
+        source_row_idxs: list[int],
+        initial_score_result: dict,
+        reroll_score_result: dict,
+        scorer_config: dict,
+        threshold_100: float,
+    ) -> DataProto | None:
+        if not _is_truthy(scorer_config.get("reroll_sft_enable", False)):
+            return None
+
+        rewards = self._reroll_sft_weighted_scores(
+            initial_score_result=initial_score_result,
+            reroll_score_result=reroll_score_result,
+            source_row_idxs=source_row_idxs,
+            scorer_config=scorer_config,
+        )
+        weights = self._compute_reroll_sft_weights(rewards, scorer_config)
+        selected_positions = np.where(weights > 0.0)[0].astype(np.int64).tolist()
+        if not selected_positions:
+            return None
+
+        selected_source_idxs = [source_row_idxs[position] for position in selected_positions]
+        sft_batch = original_batch.select_idxs(selected_source_idxs)
+        reroll_rows = reroll_batch.select_idxs(selected_positions)
+        prompt_len = sft_batch.batch["prompts"].shape[-1]
+
+        sft_batch.batch["responses"] = reroll_rows.batch["responses"].clone()
+        for stale_key in ("rollout_log_probs", "rollout_is_weights"):
+            if stale_key in sft_batch.batch:
+                sft_batch.batch.pop(stale_key)
+        sft_batch.batch["input_ids"] = torch.cat(
+            [sft_batch.batch["prompts"], sft_batch.batch["responses"]],
+            dim=-1,
+        )
+        prompt_attention_mask = sft_batch.batch["attention_mask"][:, :prompt_len].clone()
+        reroll_response_mask = reroll_rows.batch.get("response_mask", None)
+        if reroll_response_mask is None:
+            reroll_response_mask = reroll_rows.batch["attention_mask"][:, prompt_len:]
+        sft_batch.batch["attention_mask"] = torch.cat(
+            [prompt_attention_mask, reroll_response_mask.to(prompt_attention_mask.device)],
+            dim=-1,
+        )
+        new_position_ids = compute_position_id_with_mask(sft_batch.batch["attention_mask"])
+        if sft_batch.batch["position_ids"].dim() == 2:
+            sft_batch.batch["position_ids"] = new_position_ids.to(
+                device=sft_batch.batch["position_ids"].device,
+                dtype=sft_batch.batch["position_ids"].dtype,
+            )
+        elif sft_batch.batch["position_ids"].dim() == 3:
+            sft_batch.batch["position_ids"] = (
+                new_position_ids.to(
+                    device=sft_batch.batch["position_ids"].device,
+                    dtype=sft_batch.batch["position_ids"].dtype,
+                )
+                .unsqueeze(1)
+                .expand_as(sft_batch.batch["position_ids"])
+            )
+        sft_batch.batch["response_mask"] = compute_response_mask(sft_batch)
+
+        selected_score_result = self._select_gpt_rollout_result(reroll_score_result, selected_positions)
+        self._set_gpt_rollout_result(
+            batch=sft_batch,
+            result=selected_score_result,
+            prefix="gpt_rollout",
+            threshold_100=threshold_100,
+        )
+        selected_gains = []
+        for output_position, source_idx in zip(selected_positions, selected_source_idxs):
+            initial_value = self._finite_gpt_score_value(initial_score_result["scores_100"][source_idx])
+            reroll_value = self._finite_gpt_score_value(reroll_score_result["scores_100"][output_position])
+            selected_gains.append(0.0 if initial_value is None or reroll_value is None else reroll_value - initial_value)
+        sft_batch.non_tensor_batch["g_opd_sample_kind"] = np.full(len(sft_batch), "reroll_sft", dtype=object)
+        sft_batch.non_tensor_batch["g_opd_loss_weight"] = np.zeros(len(sft_batch), dtype=np.float32)
+        sft_batch.non_tensor_batch["g_opd_reroll_sft_weight"] = weights[selected_positions].astype(np.float32)
+        sft_batch.non_tensor_batch["g_opd_source_row_idx"] = np.array(selected_source_idxs, dtype=object)
+        sft_batch.non_tensor_batch["g_opd_reroll_gain_100"] = np.array(selected_gains, dtype=np.float32)
+        sft_batch.non_tensor_batch["gpt_rollout_reroll_count"] = np.ones(len(sft_batch), dtype=object)
+        if "uid" in sft_batch.non_tensor_batch:
+            sft_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(sft_batch))], dtype=object)
+        return sft_batch
 
     def _concat_training_batches(self, batches: list[DataProto]) -> DataProto:
         batches = [batch for batch in batches if batch is not None and len(batch) > 0]
@@ -1711,7 +1881,10 @@ class RayPPOTrainer:
         for batch in batches:
             for key in all_non_tensor_keys:
                 if key not in batch.non_tensor_batch:
-                    batch.non_tensor_batch[key] = np.full(len(batch), None, dtype=object)
+                    if key == "g_opd_reroll_sft_weight":
+                        batch.non_tensor_batch[key] = np.zeros(len(batch), dtype=np.float32)
+                    else:
+                        batch.non_tensor_batch[key] = np.full(len(batch), None, dtype=object)
 
         return DataProto.concat(batches)
 
@@ -1752,6 +1925,8 @@ class RayPPOTrainer:
             batch.batch["loss_mask"][pad_idxs] = 0
         if "g_opd_loss_weight" in batch.non_tensor_batch:
             batch.non_tensor_batch["g_opd_loss_weight"][pad_idxs] = 0.0
+        if "g_opd_reroll_sft_weight" in batch.non_tensor_batch:
+            batch.non_tensor_batch["g_opd_reroll_sft_weight"][pad_idxs] = 0.0
 
     def _pad_training_batch_to_update_divisor(
         self,
@@ -1784,6 +1959,8 @@ class RayPPOTrainer:
         if "g_opd_loss_weight" not in padded_batch.non_tensor_batch:
             padded_batch.non_tensor_batch["g_opd_loss_weight"] = np.full(len(padded_batch), 1.0, dtype=np.float32)
         padded_batch.non_tensor_batch["g_opd_loss_weight"][pad_idxs] = 0.0
+        if "g_opd_reroll_sft_weight" in padded_batch.non_tensor_batch:
+            padded_batch.non_tensor_batch["g_opd_reroll_sft_weight"][pad_idxs] = 0.0
         if "g_opd_sample_kind" in padded_batch.non_tensor_batch:
             padded_batch.non_tensor_batch["g_opd_sample_kind"][pad_idxs] = "padding"
         if "uid" in padded_batch.non_tensor_batch:
@@ -1825,6 +2002,301 @@ class RayPPOTrainer:
             return "rubric_high_teacher_low"
         return "rank_tie"
 
+    def _gpt_history_random_bucket(
+        self,
+        *,
+        row_idx: int,
+        uid: object | None,
+        bucket_count: int,
+        seed: int,
+    ) -> str:
+        bucket_count = max(1, int(bucket_count))
+        key = f"{seed}:{uid if uid is not None else row_idx}"
+        digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+        bucket_idx = int.from_bytes(digest, byteorder="big", signed=False) % bucket_count
+        return f"random_{bucket_idx}"
+
+    def _history_zscore_shift(
+        self,
+        *,
+        scorer_config,
+        rubric_scores: list[float | None],
+        valid_mask: np.ndarray,
+        non_padding_mask: np.ndarray,
+        batch: DataProto,
+        coef: float,
+        clip: float,
+        metrics: dict,
+    ) -> np.ndarray:
+        shift = np.zeros(len(rubric_scores), dtype=np.float32)
+        history_size = max(1, int(scorer_config.get("history_size", 2048)))
+        warmup_steps = max(0, int(scorer_config.get("history_warmup_steps", 5)))
+        min_bin_count = max(1, int(scorer_config.get("history_min_bin_count", 64)))
+        global_min_count = max(1, int(scorer_config.get("history_global_min_count", 256)))
+        std_floor = max(float(scorer_config.get("history_std_floor", 12.5)), 1e-6)
+        z_clip = abs(float(scorer_config.get("history_z_clip", 2.0)))
+        negative_coef_scale = max(0.0, float(scorer_config.get("history_negative_coef_scale", 0.5)))
+        min_component_count = max(1, min_bin_count // 2)
+        bucket_mode = str(scorer_config.get("history_bucket_mode", "label")).strip().lower()
+        if bucket_mode not in {"label", "random"}:
+            bucket_mode = "label"
+        random_bucket_count = max(1, int(scorer_config.get("history_num_bins", 12)))
+        random_bucket_seed = int(scorer_config.get("history_random_bucket_seed", 42))
+        valid_domains = {
+            "geometry_visual",
+            "algebra_symbolic",
+            "discrete_counting_process",
+            "arithmetic_number_modeling",
+        }
+        valid_difficulties = {"easy", "medium", "hard"}
+
+        while len(self._gpt_rubric_history) > history_size:
+            self._gpt_rubric_history.popleft()
+
+        history = list(self._gpt_rubric_history)
+        history_count = int(len(history))
+        metrics["g_opd_rubric_adv_shift/history_count"] = history_count
+        metrics["g_opd_rubric_adv_shift/history_num_bins"] = 12 if bucket_mode == "label" else random_bucket_count
+        metrics["g_opd_rubric_adv_shift/history_bucket_mode_label"] = 1 if bucket_mode == "label" else 0
+        metrics["g_opd_rubric_adv_shift/history_bucket_mode_random"] = 1 if bucket_mode == "random" else 0
+        metrics["g_opd_rubric_adv_shift/history_random_bucket_seed"] = random_bucket_seed
+        metrics["g_opd_rubric_adv_shift/history_warmup_steps"] = warmup_steps
+        metrics["g_opd_rubric_adv_shift/history_min_bin_count"] = min_bin_count
+        metrics["g_opd_rubric_adv_shift/history_min_component_count"] = min_component_count
+        metrics["g_opd_rubric_adv_shift/history_global_min_count"] = global_min_count
+        metrics["g_opd_rubric_adv_shift/history_std_floor"] = std_floor
+        metrics["g_opd_rubric_adv_shift/history_z_clip"] = z_clip
+        metrics["g_opd_rubric_adv_shift/history_negative_coef_scale"] = negative_coef_scale
+
+        use_history = self.global_steps >= warmup_steps and history_count >= global_min_count
+        if use_history:
+            bucket_scores: dict[tuple[str, str] | str, list[float]] = defaultdict(list)
+            domain_scores: dict[str, list[float]] = defaultdict(list)
+            difficulty_scores: dict[str, list[float]] = defaultdict(list)
+            global_scores: list[float] = []
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                domain = str(item.get("domain") or "").strip().lower()
+                difficulty = str(item.get("difficulty") or "").strip().lower()
+                try:
+                    rubric_value = float(item.get("rubric"))
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(rubric_value):
+                    continue
+                if bucket_mode == "random":
+                    bucket = str(item.get("bucket") or "").strip().lower()
+                    if not bucket:
+                        continue
+                    bucket_scores[bucket].append(rubric_value)
+                else:
+                    if domain not in valid_domains or difficulty not in valid_difficulties:
+                        continue
+                    bucket_scores[(domain, difficulty)].append(rubric_value)
+                    domain_scores[domain].append(rubric_value)
+                    difficulty_scores[difficulty].append(rubric_value)
+                global_scores.append(rubric_value)
+
+            if len(global_scores) < global_min_count:
+                use_history = False
+            else:
+                global_array = np.array(global_scores, dtype=np.float32)
+                global_mean = float(np.mean(global_array))
+                global_std = max(float(np.std(global_array)), std_floor)
+                if bucket_mode == "label":
+                    for domain in sorted(valid_domains):
+                        metrics[f"g_opd_rubric_adv_shift/history_domain_count/{domain}"] = int(
+                            len(domain_scores.get(domain, []))
+                        )
+                    for difficulty in ("easy", "medium", "hard"):
+                        metrics[f"g_opd_rubric_adv_shift/history_difficulty_count/{difficulty}"] = int(
+                            len(difficulty_scores.get(difficulty, []))
+                        )
+                else:
+                    for bucket_idx in range(random_bucket_count):
+                        bucket_key = f"random_{bucket_idx}"
+                        metrics[f"g_opd_rubric_adv_shift/history_random_bucket_count/{bucket_key}"] = int(
+                            len(bucket_scores.get(bucket_key, []))
+                        )
+
+            rubric_array = np.array(
+                [np.nan if value is None else float(value) for value in rubric_scores],
+                dtype=np.float32,
+            )
+            used_bin_count = 0
+            used_blended_count = 0
+            used_domain_count = 0
+            used_difficulty_count = 0
+            used_global_count = 0
+            skipped_missing_label_count = 0
+            z_values: list[float] = []
+            if use_history:
+                domains = batch.non_tensor_batch.get("gpt_rollout_problem_domain", None)
+                difficulties = batch.non_tensor_batch.get("gpt_rollout_difficulty_3", None)
+                uids = batch.non_tensor_batch.get("uid", None)
+                domains_list = domains.tolist() if domains is not None and hasattr(domains, "tolist") else domains
+                difficulties_list = (
+                    difficulties.tolist() if difficulties is not None and hasattr(difficulties, "tolist") else difficulties
+                )
+                uids_list = uids.tolist() if uids is not None and hasattr(uids, "tolist") else uids
+                for idx in np.where(valid_mask)[0]:
+                    rubric_value = float(rubric_array[idx])
+                    if not np.isfinite(rubric_value):
+                        continue
+                    if bucket_mode == "random":
+                        bucket = self._gpt_history_random_bucket(
+                            row_idx=int(idx),
+                            uid=(
+                                uids_list[idx]
+                                if uids_list is not None and idx < len(uids_list)
+                                else None
+                            ),
+                            bucket_count=random_bucket_count,
+                            seed=random_bucket_seed,
+                        )
+                        exact = bucket_scores.get(bucket, [])
+                        if len(exact) >= min_bin_count:
+                            selected_scores = exact
+                            used_bin_count += 1
+                        elif len(exact) > 0:
+                            selected_scores = list(global_scores) + list(exact) * max(
+                                1,
+                                min_bin_count // max(len(exact), 1),
+                            )
+                            used_blended_count += 1
+                        else:
+                            selected_scores = list(global_scores)
+                            used_global_count += 1
+                        score_array = np.array(selected_scores, dtype=np.float32)
+                        baseline_mean = float(np.mean(score_array))
+                        baseline_std = max(float(np.std(score_array)), std_floor)
+                        z_value = float(np.clip((rubric_value - baseline_mean) / baseline_std, -z_clip, z_clip))
+                        z_values.append(z_value)
+                        local_coef = coef if z_value >= 0.0 else coef * negative_coef_scale
+                        shift[idx] = float(np.clip(local_coef * z_value, -clip, clip))
+                        continue
+                    domain = (
+                        str(domains_list[idx] or "").strip().lower()
+                        if domains_list is not None and idx < len(domains_list)
+                        else ""
+                    )
+                    difficulty = (
+                        str(difficulties_list[idx] or "").strip().lower()
+                        if difficulties_list is not None and idx < len(difficulties_list)
+                        else ""
+                    )
+                    if domain not in valid_domains or difficulty not in valid_difficulties:
+                        skipped_missing_label_count += 1
+                        continue
+
+                    exact = bucket_scores.get((domain, difficulty), [])
+                    domain_values = domain_scores.get(domain, [])
+                    difficulty_values = difficulty_scores.get(difficulty, [])
+                    selected_scores: list[float]
+                    if len(exact) >= min_bin_count:
+                        selected_scores = exact
+                        used_bin_count += 1
+                    else:
+                        components = [list(global_scores)]
+                        if len(domain_values) >= min_component_count:
+                            components.append(list(domain_values))
+                        if len(difficulty_values) >= min_component_count:
+                            components.append(list(difficulty_values))
+                        if len(exact) > 0:
+                            components.append(list(exact) * max(1, min_bin_count // max(len(exact), 1)))
+                        selected_scores = [value for component in components for value in component]
+                        if len(domain_values) >= min_component_count and len(difficulty_values) >= min_component_count:
+                            used_blended_count += 1
+                        elif len(domain_values) >= min_component_count:
+                            used_domain_count += 1
+                        elif len(difficulty_values) >= min_component_count:
+                            used_difficulty_count += 1
+                        else:
+                            used_global_count += 1
+
+                    score_array = np.array(selected_scores, dtype=np.float32)
+                    baseline_mean = float(np.mean(score_array))
+                    baseline_std = max(float(np.std(score_array)), std_floor)
+                    z_value = float(np.clip((rubric_value - baseline_mean) / baseline_std, -z_clip, z_clip))
+                    z_values.append(z_value)
+                    local_coef = coef if z_value >= 0.0 else coef * negative_coef_scale
+                    shift[idx] = float(np.clip(local_coef * z_value, -clip, clip))
+
+                metrics["g_opd_rubric_adv_shift/history_active"] = 1
+                metrics["g_opd_rubric_adv_shift/history_global_mean"] = global_mean
+                metrics["g_opd_rubric_adv_shift/history_global_std"] = global_std
+                metrics["g_opd_rubric_adv_shift/history_bucket_count"] = len(bucket_scores)
+                metrics["g_opd_rubric_adv_shift/history_used_bin_count"] = used_bin_count
+                metrics["g_opd_rubric_adv_shift/history_used_blended_count"] = used_blended_count
+                metrics["g_opd_rubric_adv_shift/history_used_domain_count"] = used_domain_count
+                metrics["g_opd_rubric_adv_shift/history_used_difficulty_count"] = used_difficulty_count
+                metrics["g_opd_rubric_adv_shift/history_used_global_count"] = used_global_count
+                metrics["g_opd_rubric_adv_shift/history_missing_label_count"] = skipped_missing_label_count
+                if z_values:
+                    z_array = np.array(z_values, dtype=np.float32)
+                    metrics["g_opd_rubric_adv_shift/history_z_mean"] = float(np.mean(z_array))
+                    metrics["g_opd_rubric_adv_shift/history_z_max_abs"] = float(np.max(np.abs(z_array)))
+            else:
+                metrics["g_opd_rubric_adv_shift/history_active"] = 0
+        else:
+            metrics["g_opd_rubric_adv_shift/history_active"] = 0
+
+        update_mask = valid_mask & non_padding_mask
+        sample_kinds = batch.non_tensor_batch.get("g_opd_sample_kind", None)
+        if sample_kinds is not None:
+            update_mask &= np.array([str(kind or "orig") == "orig" for kind in sample_kinds.tolist()], dtype=bool)
+        domains = batch.non_tensor_batch.get("gpt_rollout_problem_domain", None)
+        difficulties = batch.non_tensor_batch.get("gpt_rollout_difficulty_3", None)
+        uids = batch.non_tensor_batch.get("uid", None)
+        domains_list = domains.tolist() if domains is not None and hasattr(domains, "tolist") else domains
+        difficulties_list = difficulties.tolist() if difficulties is not None and hasattr(difficulties, "tolist") else difficulties
+        uids_list = uids.tolist() if uids is not None and hasattr(uids, "tolist") else uids
+        added = 0
+        skipped_label_update_count = 0
+        for idx in np.where(update_mask)[0]:
+            rubric_value = rubric_scores[idx]
+            if rubric_value is None:
+                continue
+            rubric_value = float(rubric_value)
+            if not np.isfinite(rubric_value):
+                continue
+            if bucket_mode == "random":
+                bucket = self._gpt_history_random_bucket(
+                    row_idx=int(idx),
+                    uid=(
+                        uids_list[idx]
+                        if uids_list is not None and idx < len(uids_list)
+                        else None
+                    ),
+                    bucket_count=random_bucket_count,
+                    seed=random_bucket_seed,
+                )
+                self._gpt_rubric_history.append({"bucket": bucket, "rubric": rubric_value})
+                added += 1
+                continue
+            domain = (
+                str(domains_list[idx] or "").strip().lower()
+                if domains_list is not None and idx < len(domains_list)
+                else ""
+            )
+            difficulty = (
+                str(difficulties_list[idx] or "").strip().lower()
+                if difficulties_list is not None and idx < len(difficulties_list)
+                else ""
+            )
+            if domain not in valid_domains or difficulty not in valid_difficulties:
+                skipped_label_update_count += 1
+                continue
+            self._gpt_rubric_history.append({"domain": domain, "difficulty": difficulty, "rubric": rubric_value})
+            added += 1
+        while len(self._gpt_rubric_history) > history_size:
+            self._gpt_rubric_history.popleft()
+        metrics["g_opd_rubric_adv_shift/history_added_count"] = added
+        metrics["g_opd_rubric_adv_shift/history_skipped_label_update_count"] = skipped_label_update_count
+        metrics["g_opd_rubric_adv_shift/history_count_after_update"] = int(len(self._gpt_rubric_history))
+        return shift
+
     def _rank_gap_entries(
         self,
         batch: DataProto,
@@ -1860,6 +2332,18 @@ class RayPPOTrainer:
                     "rubric_rank": rubric_rank,
                     "teacher_score": teacher_scores[idx],
                     "rubric_score_100": rubric_scores[idx],
+                    "gpt_problem_domain": self._get_non_tensor_row_value(
+                        batch,
+                        "gpt_rollout_problem_domain",
+                        idx,
+                        None,
+                    ),
+                    "gpt_difficulty_3": self._get_non_tensor_row_value(
+                        batch,
+                        "gpt_rollout_difficulty_3",
+                        idx,
+                        None,
+                    ),
                     "sample_kind": self._get_non_tensor_row_value(batch, "g_opd_sample_kind", idx, "orig"),
                     "source_row_idx": self._get_non_tensor_row_value(batch, "g_opd_source_row_idx", idx, None),
                     "reroll_count": self._get_non_tensor_row_value(batch, "gpt_rollout_reroll_count", idx, None),
@@ -1952,8 +2436,16 @@ class RayPPOTrainer:
             non_padding_mask = np.ones(len(batch), dtype=bool)
         else:
             non_padding_mask = ~np.array([bool(flag) for flag in padding_flags.tolist()], dtype=bool)
-        teacher_ranks = self._rank_descending(teacher_scores, eligible_mask=non_padding_mask)
-        rubric_ranks = self._rank_descending(rubric_scores, eligible_mask=non_padding_mask)
+        sample_kinds = batch.non_tensor_batch.get("g_opd_sample_kind", None)
+        if sample_kinds is None:
+            orig_mask = np.ones(len(batch), dtype=bool)
+        else:
+            orig_mask = np.array([str(kind or "orig") == "orig" for kind in sample_kinds.tolist()], dtype=bool)
+        rank_eligible_mask = non_padding_mask & orig_mask
+        metrics["g_opd_rank_gap_drop/rank_eligible_orig_count"] = int(rank_eligible_mask.sum())
+        metrics["g_opd_rank_gap_drop/rank_excluded_non_orig_count"] = int((non_padding_mask & ~orig_mask).sum())
+        teacher_ranks = self._rank_descending(teacher_scores, eligible_mask=rank_eligible_mask)
+        rubric_ranks = self._rank_descending(rubric_scores, eligible_mask=rank_eligible_mask)
         valid_mask = (teacher_ranks >= 0) & (rubric_ranks >= 0) & non_padding_mask
         valid_count = int(valid_mask.sum())
         if valid_count <= 0:
@@ -1981,7 +2473,6 @@ class RayPPOTrainer:
         rank_gap_entries = []
         if drop_enable:
             drop_candidate_mask = np.ones(len(batch), dtype=bool)
-            sample_kinds = batch.non_tensor_batch.get("g_opd_sample_kind", None)
             if drop_scope == "appended":
                 if sample_kinds is None:
                     drop_candidate_mask = np.zeros(len(batch), dtype=bool)
@@ -2035,8 +2526,14 @@ class RayPPOTrainer:
                     non_padding_mask = np.ones(len(batch), dtype=bool)
                 else:
                     non_padding_mask = ~np.array([bool(flag) for flag in padding_flags.tolist()], dtype=bool)
-                teacher_ranks = self._rank_descending(teacher_scores, eligible_mask=non_padding_mask)
-                rubric_ranks = self._rank_descending(rubric_scores, eligible_mask=non_padding_mask)
+                sample_kinds = batch.non_tensor_batch.get("g_opd_sample_kind", None)
+                if sample_kinds is None:
+                    orig_mask = np.ones(len(batch), dtype=bool)
+                else:
+                    orig_mask = np.array([str(kind or "orig") == "orig" for kind in sample_kinds.tolist()], dtype=bool)
+                rank_eligible_mask = non_padding_mask & orig_mask
+                teacher_ranks = self._rank_descending(teacher_scores, eligible_mask=rank_eligible_mask)
+                rubric_ranks = self._rank_descending(rubric_scores, eligible_mask=rank_eligible_mask)
                 valid_mask = (teacher_ranks >= 0) & (rubric_ranks >= 0) & non_padding_mask
                 valid_count = int(valid_mask.sum())
                 rank_gap = np.zeros(len(batch), dtype=np.float32)
@@ -2070,7 +2567,7 @@ class RayPPOTrainer:
         shift = np.zeros(len(batch), dtype=np.float32)
         if shift_enable and valid_count > 0:
             mode = str(scorer_config.get("rubric_adv_shift_mode", "rank_residual")).strip().lower()
-            if mode not in {"rank_residual", "rubric_rank"}:
+            if mode not in {"rank_residual", "rubric_rank", "history_zscore"}:
                 mode = "rank_residual"
             coef = float(scorer_config.get("rubric_adv_shift_coef", 0.10))
             clip = abs(float(scorer_config.get("rubric_adv_shift_clip", 0.20)))
@@ -2080,6 +2577,17 @@ class RayPPOTrainer:
                 centered = np.zeros(len(batch), dtype=np.float32)
                 centered[valid_mask] = 0.5 - (rubric_ranks[valid_mask].astype(np.float32) / denominator)
                 raw_shift = 2.0 * coef * centered
+            elif mode == "history_zscore":
+                raw_shift = self._history_zscore_shift(
+                    scorer_config=scorer_config,
+                    rubric_scores=rubric_scores,
+                    valid_mask=valid_mask,
+                    non_padding_mask=non_padding_mask,
+                    batch=batch,
+                    coef=coef,
+                    clip=clip,
+                    metrics=metrics,
+                )
             else:
                 # Correct teacher preference only when rubric ranks the sample differently.
                 raw_shift[valid_mask] = (
@@ -2092,6 +2600,7 @@ class RayPPOTrainer:
             metrics["g_opd_rubric_adv_shift/clip"] = clip
             metrics["g_opd_rubric_adv_shift/mode_rank_residual"] = 1 if mode == "rank_residual" else 0
             metrics["g_opd_rubric_adv_shift/mode_rubric_rank"] = 1 if mode == "rubric_rank" else 0
+            metrics["g_opd_rubric_adv_shift/mode_history_zscore"] = 1 if mode == "history_zscore" else 0
             metrics["g_opd_rubric_adv_shift/mean"] = float(np.mean(shift[valid_mask]))
             metrics["g_opd_rubric_adv_shift/max_abs"] = float(np.max(np.abs(shift[valid_mask])))
             metrics["g_opd_rubric_adv_shift/positive_count"] = int((shift[valid_mask] > 0).sum())
@@ -2125,7 +2634,14 @@ class RayPPOTrainer:
         configured_max_attempts = int(scorer_config.get("max_rerollout_attempts", 1))
         max_attempts = min(max(configured_max_attempts, 0), 1)
         orig_loss_weight = float(scorer_config.get("orig_loss_weight", 1.0))
+        reroll_sft_enable = _is_truthy(scorer_config.get("reroll_sft_enable", False))
+        append_reroll_hint_to_opd = _is_truthy(scorer_config.get("reroll_sft_keep_hint_opd", not reroll_sft_enable))
         reroll_hint_loss_weight = float(scorer_config.get("reroll_hint_loss_weight", 0.5))
+        append_require_improvement = _is_truthy(
+            scorer_config.get("reroll_append_require_improvement", True)
+        )
+        append_min_gain = float(scorer_config.get("reroll_append_min_gain", 0.0))
+        append_min_score = float(scorer_config.get("reroll_append_min_score", 45.0))
         self._ensure_g_opd_sample_metadata(batch, kind="orig", loss_weight=orig_loss_weight)
         reroll_counts = np.zeros(len(batch), dtype=object)
         batch.non_tensor_batch["gpt_rollout_reroll_count"] = reroll_counts
@@ -2138,11 +2654,18 @@ class RayPPOTrainer:
         metrics["gpt_rollout_reroll/initial_timeout_passthrough_count"] = len(initial_timeout_idxs)
         metrics["gpt_rollout_reroll/threshold_100"] = threshold_100
         metrics["gpt_rollout_reroll/max_attempts"] = max_attempts
+        metrics["gpt_rollout_reroll/append_require_improvement"] = 1 if append_require_improvement else 0
+        metrics["gpt_rollout_reroll/append_min_gain"] = append_min_gain
+        metrics["gpt_rollout_reroll/append_min_score"] = append_min_score
         self._debug_progress(
             f"gpt_reroll:start low_count={len(low_idxs)} timeout_passthrough={len(initial_timeout_idxs)} "
-            f"threshold_100={threshold_100} max_attempts={max_attempts}"
+            f"threshold_100={threshold_100} max_attempts={max_attempts} "
+            f"append_min_score={append_min_score} append_min_gain={append_min_gain} "
+            f"append_require_improvement={append_require_improvement}"
         )
         metrics["gpt_rollout_reroll/configured_max_attempts"] = configured_max_attempts
+        metrics["gpt_rollout_reroll/reroll_sft_enable"] = 1 if reroll_sft_enable else 0
+        metrics["gpt_rollout_reroll/append_hint_to_opd"] = 1 if append_reroll_hint_to_opd else 0
 
         gen_batch_for_reroll = None
         appended_batches: list[DataProto] = []
@@ -2210,12 +2733,31 @@ class RayPPOTrainer:
             append_output_positions = []
             append_batch_idxs = []
             invalid_batch_idxs = []
+            rejected_not_improved_idxs = []
+            rejected_below_min_score_idxs = []
+            rejected_reasons: dict[int, str] = {}
             for output_position, idx in enumerate(low_idxs):
-                if self._finite_gpt_score_value(reroll_score_result["scores_100"][output_position]) is not None:
-                    append_output_positions.append(output_position)
-                    append_batch_idxs.append(idx)
+                reroll_value = self._finite_gpt_score_value(
+                    reroll_score_result["scores_100"][output_position]
+                )
+                initial_value = self._finite_gpt_score_value(initial_score_result["scores_100"][idx])
+                if reroll_value is None:
+                    invalid_batch_idxs.append(idx)
+                    rejected_reasons[int(idx)] = "reroll_score_invalid"
                     continue
-                invalid_batch_idxs.append(idx)
+                if reroll_value < append_min_score:
+                    rejected_below_min_score_idxs.append(idx)
+                    rejected_reasons[int(idx)] = "reroll_score_below_min"
+                    continue
+                gain = None if initial_value is None else reroll_value - initial_value
+                if append_require_improvement and (
+                    initial_value is None or gain is None or gain <= append_min_gain
+                ):
+                    rejected_not_improved_idxs.append(idx)
+                    rejected_reasons[int(idx)] = "reroll_score_not_improved"
+                    continue
+                append_output_positions.append(output_position)
+                append_batch_idxs.append(idx)
 
             self._maybe_record_gpt_case_study_reroll_attempts(
                 initial_score_result=initial_score_result,
@@ -2224,6 +2766,7 @@ class RayPPOTrainer:
                 reroll_score_result=reroll_score_result,
                 row_idxs=low_idxs,
                 accepted_batch_idxs=append_batch_idxs,
+                rejected_reasons=rejected_reasons,
                 attempt=attempt,
             )
 
@@ -2233,21 +2776,39 @@ class RayPPOTrainer:
                     reroll_score_result,
                     append_output_positions,
                 )
+                self._inherit_gpt_problem_labels(
+                    target_result=appended_score_result,
+                    source_result=initial_score_result,
+                    source_row_idxs=append_batch_idxs,
+                )
                 self._set_gpt_rollout_result(
                     batch=appended_batch,
                     result=appended_score_result,
                     prefix="gpt_rollout",
                     threshold_100=threshold_100,
                 )
-                self._set_reroll_sample_metadata(
-                    batch=appended_batch,
+                if append_reroll_hint_to_opd:
+                    self._set_reroll_sample_metadata(
+                        batch=appended_batch,
+                        source_row_idxs=append_batch_idxs,
+                        initial_score_result=initial_score_result,
+                        reroll_score_result=appended_score_result,
+                        loss_weight=reroll_hint_loss_weight,
+                    )
+                    appended_batches.append(appended_batch)
+                sft_batch = self._build_reroll_sft_batch(
+                    original_batch=batch,
+                    reroll_batch=appended_batch,
                     source_row_idxs=append_batch_idxs,
                     initial_score_result=initial_score_result,
                     reroll_score_result=appended_score_result,
-                    loss_weight=reroll_hint_loss_weight,
+                    scorer_config=scorer_config,
+                    threshold_100=threshold_100,
                 )
-                appended_batches.append(appended_batch)
-                nohint_batch = self._build_reroll_nohint_batch(
+                if sft_batch is not None:
+                    appended_batches.append(sft_batch)
+                    metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_sft_count"] = len(sft_batch)
+                nohint_batch = None if reroll_sft_enable else self._build_reroll_nohint_batch(
                     original_batch=batch,
                     reroll_batch=appended_batch,
                     source_row_idxs=append_batch_idxs,
@@ -2266,16 +2827,33 @@ class RayPPOTrainer:
             reroll_valid_count = sum(score is not None for score in reroll_score_result["scores_100"])
             second_rollout_count = len(low_idxs)
             second_append_rate = len(append_batch_idxs) / second_rollout_count if second_rollout_count > 0 else 0.0
+            rejected_count = (
+                len(invalid_batch_idxs) + len(rejected_not_improved_idxs) + len(rejected_below_min_score_idxs)
+            )
             metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_generated_count"] = second_rollout_count
             metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rescore_valid_count"] = reroll_valid_count
             metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_appended_count"] = len(append_batch_idxs)
             metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_append_rate"] = second_append_rate
             metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_invalid_score_count"] = len(invalid_batch_idxs)
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rejected_count"] = rejected_count
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rejected_not_improved_count"] = len(
+                rejected_not_improved_idxs
+            )
+            metrics[f"gpt_rollout_reroll/attempt_{attempt + 1}_rejected_below_min_score_count"] = len(
+                rejected_below_min_score_idxs
+            )
             metrics["gpt_rollout_reroll/second_append_rate"] = second_append_rate
+            metrics["gpt_rollout_reroll/second_rejected_count"] = rejected_count
+            metrics["gpt_rollout_reroll/second_rejected_not_improved_count"] = len(rejected_not_improved_idxs)
+            metrics["gpt_rollout_reroll/second_rejected_below_min_score_count"] = len(
+                rejected_below_min_score_idxs
+            )
             self._debug_progress(
                 f"gpt_reroll_select:done attempt={attempt + 1}/{max_attempts} "
                 f"appended={len(append_batch_idxs)} "
-                f"invalid_score={len(invalid_batch_idxs)}"
+                f"invalid_score={len(invalid_batch_idxs)} "
+                f"rejected_not_improved={len(rejected_not_improved_idxs)} "
+                f"rejected_below_min_score={len(rejected_below_min_score_idxs)}"
             )
             low_idxs = []
 
@@ -2313,6 +2891,7 @@ class RayPPOTrainer:
         metrics["gpt_rollout_reroll/appended_count"] = int(sum(sample_kind_counts.values()))
         metrics["gpt_rollout_reroll/appended_hint_count"] = int(sample_kind_counts.get("reroll_hint", 0))
         metrics["gpt_rollout_reroll/appended_nohint_count"] = int(sample_kind_counts.get("reroll_nohint", 0))
+        metrics["gpt_rollout_reroll/appended_sft_count"] = int(sample_kind_counts.get("reroll_sft", 0))
         metrics["gpt_rollout_reroll/orig_count"] = len(batch)
         metrics["gpt_rollout_reroll/rescore_skipped_count"] = 0
         self._debug_progress(

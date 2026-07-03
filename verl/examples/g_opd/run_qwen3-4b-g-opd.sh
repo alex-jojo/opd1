@@ -15,7 +15,7 @@ export VERL_PRINT_CONFIG="${VERL_PRINT_CONFIG:-0}"
 export G_OPD_PROGRESS_DEBUG="${G_OPD_PROGRESS_DEBUG:-1}"
 export GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-1}"
 export WANDB_API_KEY='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'
-
+export OPENAI_API_KEY="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"
 cd /workspace/opd1/verl
 
 G_OPD_ENV_FILE="${G_OPD_ENV_FILE:-/workspace/opd1/verl/.env}"
@@ -42,8 +42,8 @@ AIME26_JSONL="${AIME26_JSONL:-/workspace/G-OPD/data/aime26/test.jsonl}"
 AIME26_PARQUET="${AIME26_PARQUET:-/workspace/G-OPD/data/aime26/test_verl.parquet}"
 export AIME26_JSONL AIME26_PARQUET
 
-STUDENT_MODEL="/workspace/models/Qwen3-1.7B"
-TEACHER_MODEL="/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500"
+STUDENT_MODEL="${STUDENT_MODEL:-/workspace/models/Qwen3-1.7B}"
+TEACHER_MODEL="${TEACHER_MODEL:-/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500}"
 
 if [ ! -f "$AIME26_JSONL" ]; then
     mkdir -p "$(dirname "$AIME26_JSONL")"
@@ -256,6 +256,7 @@ rm -rf /workspace/ray_tmp
 mkdir -p /workspace/ray_tmp
 
 G_OPD_EXPERIMENT_NAME="${G_OPD_EXPERIMENT_NAME:-146_qwen3_1.7b_teacher_qwen3_4b_vanilla_opd}"
+G_OPD_LR="${G_OPD_LR:-2e-6}"
 G_OPD_SAVE_FREQ="${G_OPD_SAVE_FREQ:-50}"
 G_OPD_DEFAULT_CKPT_DIR="/G-OPD-checkpoints/${G_OPD_EXPERIMENT_NAME}_save_step_${G_OPD_SAVE_FREQ}"
 G_OPD_CKPT_DIR="${G_OPD_CKPT_DIR:-$G_OPD_DEFAULT_CKPT_DIR}"
@@ -287,7 +288,21 @@ GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTEMPTS="${GPT_ROLLOUT_SCORE_MAX_REROLLOUT_ATTE
 GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS="${GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS:-256}"
 GPT_ROLLOUT_SCORE_ORIG_LOSS_WEIGHT="${GPT_ROLLOUT_SCORE_ORIG_LOSS_WEIGHT:-1.0}"
 GPT_ROLLOUT_SCORE_REROLL_HINT_LOSS_WEIGHT="${GPT_ROLLOUT_SCORE_REROLL_HINT_LOSS_WEIGHT:-0.5}"
-GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE:-False}"
+GPT_ROLLOUT_SCORE_REROLL_APPEND_REQUIRE_IMPROVEMENT="${GPT_ROLLOUT_SCORE_REROLL_APPEND_REQUIRE_IMPROVEMENT:-True}"
+GPT_ROLLOUT_SCORE_REROLL_APPEND_MIN_GAIN="${GPT_ROLLOUT_SCORE_REROLL_APPEND_MIN_GAIN:-20.0}"
+GPT_ROLLOUT_SCORE_REROLL_APPEND_MIN_SCORE="${GPT_ROLLOUT_SCORE_REROLL_APPEND_MIN_SCORE:-75.0}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_ENABLE="${GPT_ROLLOUT_SCORE_REROLL_SFT_ENABLE:-False}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_KEEP_HINT_OPD="${GPT_ROLLOUT_SCORE_REROLL_SFT_KEEP_HINT_OPD:-False}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_LAMBDA="${GPT_ROLLOUT_SCORE_REROLL_SFT_LAMBDA:-0.05}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_ALPHA="${GPT_ROLLOUT_SCORE_REROLL_SFT_ALPHA:-0.5}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_Z_CLIP="${GPT_ROLLOUT_SCORE_REROLL_SFT_Z_CLIP:-2.0}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_WEIGHT_MIN="${GPT_ROLLOUT_SCORE_REROLL_SFT_WEIGHT_MIN:-0.1}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_WEIGHT_MAX="${GPT_ROLLOUT_SCORE_REROLL_SFT_WEIGHT_MAX:-4.0}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_NORMALIZE_WEIGHTS="${GPT_ROLLOUT_SCORE_REROLL_SFT_NORMALIZE_WEIGHTS:-True}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_STD_FLOOR="${GPT_ROLLOUT_SCORE_REROLL_SFT_STD_FLOOR:-1e-6}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_SCORE_COEF="${GPT_ROLLOUT_SCORE_REROLL_SFT_SCORE_COEF:-0.5}"
+GPT_ROLLOUT_SCORE_REROLL_SFT_GAIN_COEF="${GPT_ROLLOUT_SCORE_REROLL_SFT_GAIN_COEF:-0.5}"
+GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE:-True}"
 GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_SCORE="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_SCORE:-50}"
 GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_GAIN="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_GAIN:-10}"
 GPT_ROLLOUT_SCORE_REROLL_NOHINT_MAX_WEIGHT="${GPT_ROLLOUT_SCORE_REROLL_NOHINT_MAX_WEIGHT:-0.5}"
@@ -296,8 +311,18 @@ GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_ENABLE="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_
 GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_MODE="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_MODE:-rank_residual}"
 GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_COEF="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_COEF:-0.10}"
 GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_CLIP="${GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_CLIP:-0.20}"
+GPT_ROLLOUT_SCORE_HISTORY_NUM_BINS="${GPT_ROLLOUT_SCORE_HISTORY_NUM_BINS:-12}"
+GPT_ROLLOUT_SCORE_HISTORY_BUCKET_MODE="${GPT_ROLLOUT_SCORE_HISTORY_BUCKET_MODE:-label}"
+GPT_ROLLOUT_SCORE_HISTORY_RANDOM_BUCKET_SEED="${GPT_ROLLOUT_SCORE_HISTORY_RANDOM_BUCKET_SEED:-42}"
+GPT_ROLLOUT_SCORE_HISTORY_SIZE="${GPT_ROLLOUT_SCORE_HISTORY_SIZE:-2048}"
+GPT_ROLLOUT_SCORE_HISTORY_WARMUP_STEPS="${GPT_ROLLOUT_SCORE_HISTORY_WARMUP_STEPS:-5}"
+GPT_ROLLOUT_SCORE_HISTORY_MIN_BIN_COUNT="${GPT_ROLLOUT_SCORE_HISTORY_MIN_BIN_COUNT:-64}"
+GPT_ROLLOUT_SCORE_HISTORY_GLOBAL_MIN_COUNT="${GPT_ROLLOUT_SCORE_HISTORY_GLOBAL_MIN_COUNT:-256}"
+GPT_ROLLOUT_SCORE_HISTORY_STD_FLOOR="${GPT_ROLLOUT_SCORE_HISTORY_STD_FLOOR:-8.0}"
+GPT_ROLLOUT_SCORE_HISTORY_Z_CLIP="${GPT_ROLLOUT_SCORE_HISTORY_Z_CLIP:-2.0}"
+GPT_ROLLOUT_SCORE_HISTORY_NEGATIVE_COEF_SCALE="${GPT_ROLLOUT_SCORE_HISTORY_NEGATIVE_COEF_SCALE:-0.8}"
 GPT_ROLLOUT_SCORE_RANK_GAP_DROP_ENABLE="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_ENABLE:-True}"
-GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD:-0.80}"
+GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD:-0.75}"
 GPT_ROLLOUT_SCORE_RANK_GAP_DROP_SCOPE="${GPT_ROLLOUT_SCORE_RANK_GAP_DROP_SCOPE:-all}"
 GPT_ROLLOUT_SCORE_VERBOSE="${GPT_ROLLOUT_SCORE_VERBOSE:-1}"
 G_OPD_LOG_DIR="${G_OPD_LOG_DIR:-/workspace/G-OPD-logs/${G_OPD_EXPERIMENT_NAME}_save_step_${G_OPD_SAVE_FREQ}}"
@@ -337,7 +362,7 @@ python3 -m verl.trainer.main_ppo \
         +data.apply_chat_template_kwargs.enable_thinking=False \
         actor_rollout_ref.model.path="$STUDENT_MODEL" \
         +actor_rollout_ref.ref.model.path="$TEACHER_MODEL" \
-        actor_rollout_ref.actor.optim.lr=2e-6 \
+        actor_rollout_ref.actor.optim.lr="$G_OPD_LR" \
         data.filter_overlong_prompts_workers=4 \
         actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
         actor_rollout_ref.model.use_remove_padding=True \
@@ -354,6 +379,7 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
         actor_rollout_ref.actor.fsdp_config.param_offload=False \
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+        actor_rollout_ref.actor.checkpoint.save_contents='["model"]' \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
         actor_rollout_ref.rollout.name=vllm \
@@ -387,6 +413,20 @@ python3 -m verl.trainer.main_ppo \
         trainer.gpt_rollout_score.max_reroll_context_tokens="$GPT_ROLLOUT_SCORE_MAX_REROLL_CONTEXT_TOKENS" \
         trainer.gpt_rollout_score.orig_loss_weight="$GPT_ROLLOUT_SCORE_ORIG_LOSS_WEIGHT" \
         trainer.gpt_rollout_score.reroll_hint_loss_weight="$GPT_ROLLOUT_SCORE_REROLL_HINT_LOSS_WEIGHT" \
+        trainer.gpt_rollout_score.reroll_append_require_improvement="$GPT_ROLLOUT_SCORE_REROLL_APPEND_REQUIRE_IMPROVEMENT" \
+        trainer.gpt_rollout_score.reroll_append_min_gain="$GPT_ROLLOUT_SCORE_REROLL_APPEND_MIN_GAIN" \
+        trainer.gpt_rollout_score.reroll_append_min_score="$GPT_ROLLOUT_SCORE_REROLL_APPEND_MIN_SCORE" \
+        trainer.gpt_rollout_score.reroll_sft_enable="$GPT_ROLLOUT_SCORE_REROLL_SFT_ENABLE" \
+        trainer.gpt_rollout_score.reroll_sft_keep_hint_opd="$GPT_ROLLOUT_SCORE_REROLL_SFT_KEEP_HINT_OPD" \
+        trainer.gpt_rollout_score.reroll_sft_lambda="$GPT_ROLLOUT_SCORE_REROLL_SFT_LAMBDA" \
+        trainer.gpt_rollout_score.reroll_sft_alpha="$GPT_ROLLOUT_SCORE_REROLL_SFT_ALPHA" \
+        trainer.gpt_rollout_score.reroll_sft_z_clip="$GPT_ROLLOUT_SCORE_REROLL_SFT_Z_CLIP" \
+        trainer.gpt_rollout_score.reroll_sft_weight_min="$GPT_ROLLOUT_SCORE_REROLL_SFT_WEIGHT_MIN" \
+        trainer.gpt_rollout_score.reroll_sft_weight_max="$GPT_ROLLOUT_SCORE_REROLL_SFT_WEIGHT_MAX" \
+        trainer.gpt_rollout_score.reroll_sft_normalize_weights="$GPT_ROLLOUT_SCORE_REROLL_SFT_NORMALIZE_WEIGHTS" \
+        trainer.gpt_rollout_score.reroll_sft_std_floor="$GPT_ROLLOUT_SCORE_REROLL_SFT_STD_FLOOR" \
+        trainer.gpt_rollout_score.reroll_sft_score_coef="$GPT_ROLLOUT_SCORE_REROLL_SFT_SCORE_COEF" \
+        trainer.gpt_rollout_score.reroll_sft_gain_coef="$GPT_ROLLOUT_SCORE_REROLL_SFT_GAIN_COEF" \
         trainer.gpt_rollout_score.reroll_nohint_enable="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_ENABLE" \
         trainer.gpt_rollout_score.reroll_nohint_min_score="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_SCORE" \
         trainer.gpt_rollout_score.reroll_nohint_min_gain="$GPT_ROLLOUT_SCORE_REROLL_NOHINT_MIN_GAIN" \
@@ -396,6 +436,16 @@ python3 -m verl.trainer.main_ppo \
         trainer.gpt_rollout_score.rubric_adv_shift_mode="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_MODE" \
         trainer.gpt_rollout_score.rubric_adv_shift_coef="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_COEF" \
         trainer.gpt_rollout_score.rubric_adv_shift_clip="$GPT_ROLLOUT_SCORE_RUBRIC_ADV_SHIFT_CLIP" \
+        trainer.gpt_rollout_score.history_num_bins="$GPT_ROLLOUT_SCORE_HISTORY_NUM_BINS" \
+        trainer.gpt_rollout_score.history_bucket_mode="$GPT_ROLLOUT_SCORE_HISTORY_BUCKET_MODE" \
+        trainer.gpt_rollout_score.history_random_bucket_seed="$GPT_ROLLOUT_SCORE_HISTORY_RANDOM_BUCKET_SEED" \
+        trainer.gpt_rollout_score.history_size="$GPT_ROLLOUT_SCORE_HISTORY_SIZE" \
+        trainer.gpt_rollout_score.history_warmup_steps="$GPT_ROLLOUT_SCORE_HISTORY_WARMUP_STEPS" \
+        trainer.gpt_rollout_score.history_min_bin_count="$GPT_ROLLOUT_SCORE_HISTORY_MIN_BIN_COUNT" \
+        trainer.gpt_rollout_score.history_global_min_count="$GPT_ROLLOUT_SCORE_HISTORY_GLOBAL_MIN_COUNT" \
+        trainer.gpt_rollout_score.history_std_floor="$GPT_ROLLOUT_SCORE_HISTORY_STD_FLOOR" \
+        trainer.gpt_rollout_score.history_z_clip="$GPT_ROLLOUT_SCORE_HISTORY_Z_CLIP" \
+        trainer.gpt_rollout_score.history_negative_coef_scale="$GPT_ROLLOUT_SCORE_HISTORY_NEGATIVE_COEF_SCALE" \
         trainer.gpt_rollout_score.rank_gap_drop_enable="$GPT_ROLLOUT_SCORE_RANK_GAP_DROP_ENABLE" \
         trainer.gpt_rollout_score.rank_gap_drop_threshold="$GPT_ROLLOUT_SCORE_RANK_GAP_DROP_THRESHOLD" \
         trainer.gpt_rollout_score.rank_gap_drop_scope="$GPT_ROLLOUT_SCORE_RANK_GAP_DROP_SCOPE" \

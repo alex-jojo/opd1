@@ -1,0 +1,17 @@
+timestamp	baseline	stage	status	path
+2026-06-11T12:10:15Z	eopd	train	started	/EOPD-checkpoints/eopd_217_qwen3_4b_eopd_teacher_qwen3_4b_non_thinking_rl_math_save_step_50
+2026-06-11T16:09:01Z	eopd	train	completed	/EOPD-checkpoints/eopd_217_qwen3_4b_eopd_teacher_qwen3_4b_non_thinking_rl_math_save_step_50/global_step_110/actor
+2026-06-11T16:09:04Z	eopd	eval	started	/workspace/opd1/baseline_runs/20260611T121015Z/eopd/eval_outputs
+2026-06-11T17:07:48Z	eopd	eval	completed	/workspace/opd1/baseline_runs/20260611T121015Z/eopd/eval_outputs/summary.csv
+2026-06-11T17:07:52Z	eopd	cleanup	deleted	/EOPD-checkpoints/eopd_217_qwen3_4b_eopd_teacher_qwen3_4b_non_thinking_rl_math_save_step_50
+2026-06-11T17:07:52Z	ta_opd	train	started	/TA_OPD-checkpoints/qwen3_4b_ta_opd_teachability_ratio0.1_k16_seed42_teacher_qwen3_4b_non_thinking_rl_math_save_step_50
+2026-06-11T21:38:34Z	ta_opd	train	completed	/TA_OPD-checkpoints/qwen3_4b_ta_opd_teachability_ratio0.1_k16_seed42_teacher_qwen3_4b_non_thinking_rl_math_save_step_50/global_step_110/actor
+2026-06-11T21:38:37Z	ta_opd	eval	started	/workspace/opd1/baseline_runs/20260611T121015Z/ta_opd/eval_outputs
+2026-06-11T22:38:14Z	ta_opd	eval	completed	/workspace/opd1/baseline_runs/20260611T121015Z/ta_opd/eval_outputs/summary.csv
+2026-06-11T22:38:17Z	ta_opd	cleanup	deleted	/TA_OPD-checkpoints/qwen3_4b_ta_opd_teachability_ratio0.1_k16_seed42_teacher_qwen3_4b_non_thinking_rl_math_save_step_50
+2026-06-11T22:38:17Z	single_teacher_exopd	train	started	/G-OPD-checkpoints/146_qwen3_4b_teacher_qwen3_4b_single_teacher_exopd_lambda_1p25_save_step_50
+2026-06-12T03:16:18Z	single_teacher_exopd	train	completed	/G-OPD-checkpoints/146_qwen3_4b_teacher_qwen3_4b_single_teacher_exopd_lambda_1p25_save_step_50/global_step_110/actor
+2026-06-12T03:16:29Z	single_teacher_exopd	eval	started	/workspace/opd1/baseline_runs/20260611T121015Z/single_teacher_exopd/eval_outputs
+2026-06-12T04:27:42Z	single_teacher_exopd	eval	completed	/workspace/opd1/baseline_runs/20260611T121015Z/single_teacher_exopd/eval_outputs/summary.csv
+2026-06-12T04:27:46Z	single_teacher_exopd	cleanup	deleted	/G-OPD-checkpoints/146_qwen3_4b_teacher_qwen3_4b_single_teacher_exopd_lambda_1p25_save_step_50
+2026-06-12T04:27:46Z	all	pipeline	completed	/workspace/opd1/baseline_runs/20260611T121015Z/all_results.csv

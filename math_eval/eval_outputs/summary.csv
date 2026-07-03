@@ -1,7 +1,7 @@
 dataset,model,n,k,mean_at_k,pass_at_k,maj_at_k,status,path
-aime24,qwen3_1.7b_gopd_step110_new_8k_n8,30,8,0.22916666666666666,0.4666666666666667,0.43333333333333335,ok,/workspace/opd1/math_eval/eval_outputs/aime24/qwen3_1.7b_gopd_step110_new_8k_n8.jsonl
-aime25,qwen3_1.7b_gopd_step110_new_8k_n8,30,8,0.20833333333333334,0.3,0.3,ok,/workspace/opd1/math_eval/eval_outputs/aime25/qwen3_1.7b_gopd_step110_new_8k_n8.jsonl
-aime26,qwen3_1.7b_gopd_step110_new_8k_n8,30,8,0.175,0.26666666666666666,0.23333333333333334,ok,/workspace/opd1/math_eval/eval_outputs/aime26/qwen3_1.7b_gopd_step110_new_8k_n8.jsonl
-amc23,qwen3_1.7b_gopd_step110_new_8k_n8,40,8,0.59375,0.8,0.775,ok,/workspace/opd1/math_eval/eval_outputs/amc23/qwen3_1.7b_gopd_step110_new_8k_n8.jsonl
-hmmt26,qwen3_1.7b_gopd_step110_new_8k_n8,33,8,0.12878787878787878,0.18181818181818182,0.18181818181818182,ok,/workspace/opd1/math_eval/eval_outputs/hmmt26/qwen3_1.7b_gopd_step110_new_8k_n8.jsonl
-math500,qwen3_1.7b_gopd_step110_new_8k_n8,500,8,0.829,0.916,0.902,ok,/workspace/opd1/math_eval/eval_outputs/math500/qwen3_1.7b_gopd_step110_new_8k_n8.jsonl
+aime24,146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8,30,8,0.4041666666666667,0.6666666666666666,0.6333333333333333,ok,/workspace/opd1/math_eval/eval_outputs/aime24/146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8.jsonl
+aime25,146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8,30,8,0.3333333333333333,0.5,0.5,ok,/workspace/opd1/math_eval/eval_outputs/aime25/146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8.jsonl
+aime26,146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8,30,8,0.32916666666666666,0.43333333333333335,0.43333333333333335,ok,/workspace/opd1/math_eval/eval_outputs/aime26/146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8.jsonl
+amc23,146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8,40,8,0.796875,0.95,0.95,ok,/workspace/opd1/math_eval/eval_outputs/amc23/146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8.jsonl
+hmmt26,146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8,33,8,0.20833333333333334,0.2727272727272727,0.2727272727272727,ok,/workspace/opd1/math_eval/eval_outputs/hmmt26/146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8.jsonl
+math500,146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8,500,8,0.901,0.948,0.938,ok,/workspace/opd1/math_eval/eval_outputs/math500/146_qwen3_4b_teacher_qwen3_4b_vanilla_opd_save_step_50_global_step_110_8k_n8.jsonl

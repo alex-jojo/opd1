@@ -1,0 +1,2 @@
+timestamp	baseline	stage	status	path
+2026-06-11T12:06:46Z	eopd	train	started	/EOPD-checkpoints/eopd_217_qwen3_4b_eopd_teacher_qwen3_4b_non_thinking_rl_math_save_step_50

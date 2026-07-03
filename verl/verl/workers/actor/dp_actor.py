@@ -462,6 +462,10 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("opd_rubric_adv_shift")
         if "g_opd_loss_weight" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("g_opd_loss_weight")
+        if "g_opd_sample_kind" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("g_opd_sample_kind")
+        if "g_opd_reroll_sft_weight" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("g_opd_reroll_sft_weight")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -492,6 +496,9 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    pg_response_mask = response_mask
+                    reroll_sft_response_mask = None
+                    reroll_sft_weight = None
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -524,6 +531,25 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    if "g_opd_sample_kind" in model_inputs and "g_opd_reroll_sft_weight" in model_inputs:
+                        kinds = model_inputs["g_opd_sample_kind"]
+                        kind_mask = torch.as_tensor(
+                            [str(kind or "orig") == "reroll_sft" for kind in kinds],
+                            device=response_mask.device,
+                            dtype=response_mask.dtype,
+                        )
+                        while kind_mask.dim() < response_mask.dim():
+                            kind_mask = kind_mask.unsqueeze(-1)
+                        reroll_sft_response_mask = response_mask * kind_mask
+                        pg_response_mask = response_mask * (1.0 - kind_mask)
+                        reroll_sft_weight = torch.as_tensor(
+                            model_inputs["g_opd_reroll_sft_weight"],
+                            device=response_mask.device,
+                            dtype=log_prob.dtype,
+                        )
+                        reroll_sft_weight = torch.clamp(reroll_sft_weight, min=0.0)
+                        while reroll_sft_weight.dim() < log_prob.dim():
+                            reroll_sft_weight = reroll_sft_weight.unsqueeze(-1)
 
                     # only use reverse KL for advantages if only_reverse_kl_advantages is True
                     if self.config.policy_loss.only_reverse_kl_advantages:
@@ -620,16 +646,37 @@ class DataParallelPPOActor(BasePPOActor):
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=pg_response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )
+                    reroll_sft_loss = log_prob.sum() * 0.0
+                    if reroll_sft_response_mask is not None and reroll_sft_response_mask.any():
+                        reroll_sft_loss_mat = -log_prob * reroll_sft_weight
+                        reroll_sft_loss = agg_loss(
+                            loss_mat=reroll_sft_loss_mat,
+                            loss_mask=reroll_sft_response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        with torch.no_grad():
+                            valid_rows = (reroll_sft_response_mask.sum(dim=-1) > 0).to(dtype=log_prob.dtype)
+                            row_weights = reroll_sft_weight.squeeze(-1)
+                            micro_batch_metrics["actor/reroll_sft_loss"] = (
+                                reroll_sft_loss.detach().item() * loss_scale_factor
+                            )
+                            micro_batch_metrics["actor/reroll_sft_tokens"] = (
+                                reroll_sft_response_mask.sum().detach().item()
+                            )
+                            micro_batch_metrics["actor/reroll_sft_rows"] = valid_rows.sum().detach().item()
+                            micro_batch_metrics["actor/reroll_sft_weight_mean"] = (
+                                (row_weights * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
+                            ).detach().item()
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
-                    if loss_mode != "rollout_correction" and rollout_log_prob is not None:
+                    if loss_mode != "rollout_correction" and rollout_log_prob is not None and pg_response_mask.any():
                         # Compute metrics using CURRENT policy π_θ vs π_rollout
                         # Tracks evolving off-policy gap as π_θ updates during mini-batch training
                         from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
@@ -637,17 +684,17 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
                             log_prob=log_prob,
                             rollout_log_prob=rollout_log_prob,
-                            response_mask=response_mask,
+                            response_mask=pg_response_mask,
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=pg_response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        policy_loss = pg_loss + reroll_sft_loss - entropy_loss * entropy_coeff
                     else:
-                        policy_loss = pg_loss
+                        policy_loss = pg_loss + reroll_sft_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
@@ -655,7 +702,7 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=pg_response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor

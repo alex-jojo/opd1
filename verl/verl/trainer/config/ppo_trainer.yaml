@@ -168,7 +168,21 @@ trainer:
     max_reroll_context_tokens: 256
     orig_loss_weight: 1.0
     reroll_hint_loss_weight: 0.5
-    reroll_nohint_enable: False
+    reroll_append_require_improvement: True
+    reroll_append_min_gain: 20.0
+    reroll_append_min_score: 75.0
+    reroll_sft_enable: False
+    reroll_sft_keep_hint_opd: False
+    reroll_sft_lambda: 0.05
+    reroll_sft_alpha: 0.5
+    reroll_sft_z_clip: 2.0
+    reroll_sft_weight_min: 0.1
+    reroll_sft_weight_max: 4.0
+    reroll_sft_normalize_weights: True
+    reroll_sft_std_floor: 1.0e-6
+    reroll_sft_score_coef: 0.5
+    reroll_sft_gain_coef: 0.5
+    reroll_nohint_enable: True
     reroll_nohint_min_score: 50
     reroll_nohint_min_gain: 10
     reroll_nohint_max_weight: 0.5
@@ -177,8 +191,18 @@ trainer:
     rubric_adv_shift_mode: rank_residual
     rubric_adv_shift_coef: 0.10
     rubric_adv_shift_clip: 0.20
+    history_num_bins: 12
+    history_bucket_mode: label
+    history_random_bucket_seed: 42
+    history_size: 2048
+    history_warmup_steps: 5
+    history_min_bin_count: 64
+    history_global_min_count: 256
+    history_std_floor: 8.0
+    history_z_clip: 2.0
+    history_negative_coef_scale: 0.8
     rank_gap_drop_enable: True
-    rank_gap_drop_threshold: 0.80
+    rank_gap_drop_threshold: 0.75
     rank_gap_drop_scope: all
     rank_gap_case_study_dir: null
 

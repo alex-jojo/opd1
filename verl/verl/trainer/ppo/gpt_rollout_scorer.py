@@ -26,6 +26,13 @@ RUBRIC_WEIGHTS = {
     "Expression Fluency": 0.10,
     "Expression Conciseness": 0.075,
 }
+PROBLEM_DOMAINS = (
+    "geometry_visual",
+    "algebra_symbolic",
+    "discrete_counting_process",
+    "arithmetic_number_modeling",
+)
+DIFFICULTY_3_VALUES = ("easy", "medium", "hard")
 
 TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 FALSE_VALUES = {"0", "false", "f", "no", "n", "off", ""}
@@ -63,6 +70,18 @@ The revision_suggestion should not mention rubric names, scores, weights, or eva
 The revision_suggestion should not say "the correct answer is..." or include the ground truth answer.
 The revision_suggestion should not provide a hidden shortcut that directly determines the final answer.
 The revision_suggestion should not merely say "try again" or "be more rigorous"; it should name a concrete reasoning action.
+
+Problem Classification Rules
+Classify the problem itself, ignoring the quality of the submitted solution. Use exactly one problem_domain:
+- geometry_visual: synthetic geometry, coordinate geometry, areas, angles, circles, polygons, diagrams, grids, spatial/visual constructions.
+- algebra_symbolic: equations, inequalities, functions, expressions, complex numbers, absolute values, symbolic casework, algebraic structure.
+- discrete_counting_process: counting, probability, arrangements, finite state processes, recurrences, sequences, digit/time/card/grid counting.
+- arithmetic_number_modeling: number theory, divisibility, modular/integer constraints, ratios, rates, units, prices, recipes, word-problem modeling.
+
+Classify difficulty_3 from the shortest reasonable solution to the problem itself:
+- easy: direct formula, direct count, direct substitution, or simple proportion; usually 1-2 core reasoning moves.
+- medium: needs one non-obvious setup, transformation, recurrence, case split, finite enumeration, or standard theorem; usually 3-6 core reasoning moves.
+- hard: needs multiple linked constraints, auxiliary construction, complex angle/area work, multi-case reasoning, or a nonlocal insight.
 
 Rubric 1: Problem Understanding and Constraint Use
 Weight: 15%
@@ -169,7 +188,7 @@ Input Format
 
 Output Format
 Please strictly output in the requested JSON schema and do not output any extra text.
-The JSON must contain only rubric_scores and revision_suggestion at the top level. Do not include weighted_score_1_to_4, final_score_100, or overall_comment."""
+The JSON must contain only rubric_scores, revision_suggestion, problem_domain, and difficulty_3 at the top level. Do not include weighted_score_1_to_4, final_score_100, or overall_comment."""
 
 REVISION_SUGGESTION_PROMPT_TEMPLATE = """You are writing a concise hint for a second attempt at a math problem.
 The previous evaluator scored the solution below 50/100 but did not provide a usable hint. Produce only one revision_suggestion.
@@ -412,10 +431,14 @@ def _score_schema() -> dict[str, Any]:
                 "additionalProperties": False,
             },
             "revision_suggestion": {"type": "string"},
+            "problem_domain": {"type": "string", "enum": list(PROBLEM_DOMAINS)},
+            "difficulty_3": {"type": "string", "enum": list(DIFFICULTY_3_VALUES)},
         },
         "required": [
             "rubric_scores",
             "revision_suggestion",
+            "problem_domain",
+            "difficulty_3",
         ],
         "additionalProperties": False,
     }
@@ -443,6 +466,16 @@ def _add_reasoning_effort(payload: dict[str, Any], model: str, reasoning_effort:
 
 def _normalize_revision_suggestion(value: Any) -> str:
     return str(value or "").strip()[:256].strip()
+
+
+def _normalize_problem_domain(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in PROBLEM_DOMAINS else None
+
+
+def _normalize_difficulty_3(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in DIFFICULTY_3_VALUES else None
 
 
 def _rubric_feedback_for_hint(rubric_scores: dict[str, Any]) -> str:
@@ -614,6 +647,12 @@ def _score_one(
             text = _extract_response_text(api_response)
             parsed = json.loads(text)
             rubric_scores = parsed["rubric_scores"]
+            problem_domain = _normalize_problem_domain(parsed.get("problem_domain"))
+            difficulty_3 = _normalize_difficulty_3(parsed.get("difficulty_3"))
+            if problem_domain is None:
+                raise ValueError(f"invalid problem_domain: {parsed.get('problem_domain')!r}")
+            if difficulty_3 is None:
+                raise ValueError(f"invalid difficulty_3: {parsed.get('difficulty_3')!r}")
             weighted_score, score_100 = _compute_scores_from_rubrics(rubric_scores)
             if verbose:
                 _debug_print(
@@ -662,6 +701,8 @@ def _score_one(
                 "reason": "",
                 "revision_suggestion": revision_suggestion,
                 "revision_suggestion_source": revision_suggestion_source,
+                "problem_domain": problem_domain,
+                "difficulty_3": difficulty_3,
                 "error": "",
             }
         except urllib.error.HTTPError as exc:
@@ -690,6 +731,8 @@ def _score_one(
         "reason": "",
         "revision_suggestion": "",
         "revision_suggestion_source": "",
+        "problem_domain": None,
+        "difficulty_3": None,
         "error": last_error,
     }
 
@@ -784,6 +827,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
                     "reason": "",
                     "revision_suggestion": "",
                     "revision_suggestion_source": "",
+                    "problem_domain": None,
+                    "difficulty_3": None,
                     "error": str(exc),
                 }
             results[idx] = result
@@ -813,6 +858,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
             "reason": "",
             "revision_suggestion": "",
             "revision_suggestion_source": "",
+            "problem_domain": None,
+            "difficulty_3": None,
             "error": "missing GPT rollout scoring result",
         }
         for result in results
@@ -830,6 +877,8 @@ def score_rollouts_with_gpt(batch: Any, tokenizer: Any, config: Any) -> dict[str
         "reasons": [result["reason"] for result in results],
         "revision_suggestions": [result["revision_suggestion"] for result in results],
         "revision_suggestion_sources": [result["revision_suggestion_source"] for result in results],
+        "problem_domains": [result["problem_domain"] for result in results],
+        "difficulty_3": [result["difficulty_3"] for result in results],
         "errors": [result["error"] for result in results],
         "models": [model for _ in results],
     }
