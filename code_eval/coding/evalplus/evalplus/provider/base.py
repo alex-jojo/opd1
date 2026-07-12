@@ -10,7 +10,7 @@ class DecoderBase(ABC):
         name: str,
         batch_size: int = 1,
         temperature: float = 0.8,
-        max_new_tokens: int = 16384,
+        max_new_tokens: int = 4096,
         dtype: str = "bfloat16",  # default
         trust_remote_code: bool = False,
         instruction_prefix: str = None,

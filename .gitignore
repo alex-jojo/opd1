@@ -189,6 +189,22 @@ wandb/
 *.log
 
 # vscode
+
+# Local experiment artifacts (downloaded or generated)
+/baseline_runs/
+/code_eval/results/
+/code_eval/coding/LiveCodeBench/lcb_outputs/
+/code_eval/coding/LiveCodeBench/code_generation_lite/
+/code_eval/coding/BFCL/
+/code_eval/coding/BFCL_v3/
+/math_eval/eval_outputs/
+/math_eval/qwen3_4b_base_eval/
+/data/
+/.codex_backups/
+/.ipynb_checkpoints/
+/*.pdf
+/*.xlsx
+*.bak*
 .vscode
 
 # local logs

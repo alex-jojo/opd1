@@ -4,7 +4,8 @@
 import os
 import sys
 
-sys.set_int_max_str_digits(50000)
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(50000)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json

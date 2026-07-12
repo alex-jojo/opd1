@@ -14,7 +14,7 @@ def make_request(
     messages: List,
     temperature: float,
     n: int,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int = 4096,
 ) -> genai.types.GenerateContentResponse:
     messages = [{"role": m["role"], "parts": [m["content"]]} for m in messages]
     response = client.generate_content(

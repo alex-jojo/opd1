@@ -4,6 +4,10 @@ set -euo pipefail
 if [ "${EOPD_SHELL_DEBUG:-0}" = "1" ]; then
     set -x
 fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERL_WORKSPACE="${VERL_WORKSPACE:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+OPD_REPO_ROOT="${OPD_REPO_ROOT:-$(cd "$VERL_WORKSPACE/.." && pwd)}"
+
 
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -12,7 +16,7 @@ export USED_MODEL="${USED_MODEL:-no_api}"
 export RAY_DISABLE_DOCKER_CPU_WARNING=1
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export VERL_PRINT_CONFIG="${VERL_PRINT_CONFIG:-0}"
-export WANDB_API_KEY='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'
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 count_visible_cuda_devices() {
     local devices="$1"
@@ -27,10 +31,9 @@ count_visible_cuda_devices() {
     echo "${#parts[@]}"
 }
 
-VERL_WORKSPACE="${VERL_WORKSPACE:-/workspace/opd1/verl}"
 cd "$VERL_WORKSPACE"
 
-EOPD_ENV_FILE="${EOPD_ENV_FILE:-/workspace/opd1/verl/.env}"
+EOPD_ENV_FILE="${EOPD_ENV_FILE:-$VERL_WORKSPACE/.env}"
 if [ -f "$EOPD_ENV_FILE" ]; then
     case "$-" in
         *x*) EOPD_RESTORE_XTRACE=1; set +x ;;
@@ -48,8 +51,8 @@ fi
 
 EOPD_N_VISIBLE_GPUS="$(count_visible_cuda_devices "$CUDA_VISIBLE_DEVICES")"
 
-TRAIN_SRC="${TRAIN_SRC:-/workspace/opd1/data/train-00000-of-00001.parquet}"
-TRAIN_FILE="${TRAIN_FILE:-/workspace/opd1/verl/train_verl.parquet}"
+TRAIN_SRC="${TRAIN_SRC:-$OPD_REPO_ROOT/data/train-00000-of-00001.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-$VERL_WORKSPACE/train_verl.parquet}"
 export TRAIN_SRC TRAIN_FILE
 
 AIME26_JSONL="${AIME26_JSONL:-/workspace/G-OPD/data/aime26/test.jsonl}"
@@ -139,7 +142,18 @@ def pick_answer(x):
     )
 
 
+def json_safe(v):
+    if hasattr(v, "tolist"):
+        return json_safe(v.tolist())
+    if isinstance(v, dict):
+        return {str(k): json_safe(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [json_safe(item) for item in v]
+    return v
+
+
 def normalize_prompt(v):
+    v = json_safe(v)
     if isinstance(v, list):
         return v
     if isinstance(v, str):
@@ -163,14 +177,14 @@ def normalize_parquet(src, dst, data_source, split):
         if problem is None:
             raise KeyError(f"{src} row {i} has no prompt/problem/question/input/query field. keys={list(x.keys())}")
 
-        reward_model = x.get("reward_model")
+        reward_model = json_safe(x.get("reward_model"))
         if not isinstance(reward_model, dict):
             reward_model = {
                 "style": "rule",
                 "ground_truth": "" if answer is None else str(answer),
             }
 
-        extra_info = x.get("extra_info")
+        extra_info = json_safe(x.get("extra_info"))
         if not isinstance(extra_info, dict):
             extra_info = {}
 
@@ -178,7 +192,7 @@ def normalize_parquet(src, dst, data_source, split):
             "split": split,
             "index": int(i),
             "answer": "" if answer is None else str(answer),
-            "problem": problem if isinstance(problem, str) else json.dumps(problem, ensure_ascii=False),
+            "problem": problem if isinstance(problem, str) else json.dumps(json_safe(problem), ensure_ascii=False),
         })
 
         rows.append({
@@ -228,7 +242,7 @@ def normalize_jsonl(src, dst, data_source, split):
                     "split": split,
                     "index": i,
                     "answer": "" if answer is None else str(answer),
-                    "problem": problem if isinstance(problem, str) else json.dumps(problem, ensure_ascii=False),
+                    "problem": problem if isinstance(problem, str) else json.dumps(json_safe(problem), ensure_ascii=False),
                 },
             })
 
@@ -320,7 +334,7 @@ python3 -m recipe.eopd_baseline.main_eopd \
         data.val_files="$AIME26_PARQUET" \
         data.train_batch_size="${EOPD_TRAIN_BATCH_SIZE:-128}" \
         data.max_prompt_length="${EOPD_MAX_PROMPT_LENGTH:-2048}" \
-        data.max_response_length="${EOPD_MAX_RESPONSE_LENGTH:-4096}" \
+        data.max_response_length="${EOPD_MAX_RESPONSE_LENGTH:-2048}" \
         data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.shuffle=True \

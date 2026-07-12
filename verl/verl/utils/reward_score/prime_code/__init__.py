@@ -13,9 +13,46 @@
 # limitations under the License.
 
 import json
+import multiprocessing as mp
 import traceback
 
 from .utils import check_correctness as apps_check_correctness
+
+
+def _run_leetcode_check(solution, test_cases, queue):
+    namespace = {}
+    code = "\n".join(
+        [
+            test_cases.get("import_prefix", ""),
+            solution,
+            test_cases.get("test_code", ""),
+        ]
+    )
+    try:
+        exec(code, namespace)
+        candidate = eval(test_cases["entry_point"], namespace)
+        namespace["check"](candidate)
+        queue.put((True, None))
+    except BaseException as exc:
+        queue.put((False, repr(exc)))
+
+
+def _compute_leetcode_score(solution, test_cases, timeout=10):
+    if not all(k in test_cases for k in ("entry_point", "test_code")):
+        return None
+
+    queue = mp.Queue(maxsize=1)
+    proc = mp.Process(target=_run_leetcode_check, args=(solution, test_cases, queue))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(1)
+        return False, {"error": "timeout"}
+    if queue.empty():
+        return False, {"error": "no_result", "exitcode": proc.exitcode}
+    success, error = queue.get()
+    return bool(success), None if success else {"error": error}
 
 
 def compute_score(completion, test_cases, continuous=False):
@@ -27,6 +64,10 @@ def compute_score(completion, test_cases, continuous=False):
                 test_cases = json.loads(test_cases)
         except Exception as e:
             print(f"Error:{e}")
+
+        leetcode_result = _compute_leetcode_score(solution, test_cases)
+        if leetcode_result is not None:
+            return leetcode_result
 
         # Complete check on all in-out pairs first. If there is no failure, per-sample test can be skipped.
         success = False

@@ -1,4 +1,5 @@
 import json
+import os
 
 try:
     from anthropic import HUMAN_PROMPT, AI_PROMPT
@@ -260,7 +261,7 @@ def format_prompt_generation(
         from transformers import AutoTokenizer
         
         tokenizer = AutoTokenizer.from_pretrained(
-            "Qwen/Qwen3-4B",
+            os.environ.get("LCB_QWEN3_TOKENIZER", "Qwen/Qwen3-4B"),
             trust_remote_code=True
         )
         prompt = "You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests. You will NOT return anything except for the program.\n\n"

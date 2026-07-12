@@ -7,6 +7,7 @@ def make_model(
     dataset: str,
     batch_size: int = 1,
     temperature: float = 0.0,
+    max_new_tokens: int = 4096,
     force_base_prompt: bool = False,
     # instruction model only
     instruction_prefix=None,
@@ -34,6 +35,7 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             dataset=dataset,
             force_base_prompt=force_base_prompt,
             tensor_parallel_size=tp,
@@ -52,6 +54,7 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             dataset=dataset,
             force_base_prompt=force_base_prompt,
             instruction_prefix=instruction_prefix,
@@ -70,6 +73,7 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             base_url=base_url,
             instruction_prefix=instruction_prefix,
             response_prefix=response_prefix,
@@ -82,6 +86,7 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             instruction_prefix=instruction_prefix,
             response_prefix=response_prefix,
         )
@@ -93,6 +98,7 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             instruction_prefix=instruction_prefix,
             response_prefix=response_prefix,
         )
@@ -104,6 +110,7 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
             instruction_prefix=instruction_prefix,
             response_prefix=response_prefix,
         )
@@ -113,10 +120,10 @@ def make_model(
         return GPTQModelDecoder(
             name=model,
             dataset=dataset,
+            max_new_tokens=max_new_tokens,
             force_base_prompt=force_base_prompt,
             instruction_prefix=instruction_prefix,
             response_prefix=response_prefix,
             trust_remote_code=trust_remote_code,
             gptqmodel_backend=gptqmodel_backend,
         )
-

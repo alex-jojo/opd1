@@ -28,6 +28,12 @@ pip install math-verify
 ## Training
 Our training data is provided in [here](https://huggingface.co/datasets/Keven16/G-OPD-Training-Data).
 
+For the reproducible Qwen3 code-distillation pipelines used in this checkout
+(0.6B, 1.7B, and 4B students; training plus LiveCodeBench/EvalPlus evaluation),
+see [CODE_EXPERIMENTS.md](CODE_EXPERIMENTS.md). The pipelines download models
+and the Skywork code split on demand; local datasets, checkpoints, and results
+are intentionally excluded from Git.
+
 ### GRPO
 
 We provide an example for GRPO training in the script `verl/examples/grpo_trainer/run_qwen3-4b-math.sh`.
