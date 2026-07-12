@@ -7,7 +7,7 @@ EOPD_EXPERIMENT_NAME="${EOPD_EXPERIMENT_NAME:-eopd_217_qwen3_4b_eopd_teacher_qwe
 EOPD_SAVE_FREQ="${EOPD_SAVE_FREQ:-50}"
 EOPD_CKPT_DIR="${EOPD_CKPT_DIR:-/EOPD-checkpoints/${EOPD_EXPERIMENT_NAME}_save_step_${EOPD_SAVE_FREQ}}"
 EOPD_STEP="${EOPD_STEP:-110}"
-export WANDB_API_KEY='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'
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 # run_eval_math.sh uses this generic checkpoint root when auto-selecting a step.
 export G_OPD_CKPT_DIR="$EOPD_CKPT_DIR"
 

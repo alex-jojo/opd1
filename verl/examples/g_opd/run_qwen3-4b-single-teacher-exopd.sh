@@ -4,6 +4,10 @@ set -euo pipefail
 if [ "${G_OPD_SHELL_DEBUG:-0}" = "1" ]; then
     set -x
 fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERL_WORKSPACE="${VERL_WORKSPACE:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+OPD_REPO_ROOT="${OPD_REPO_ROOT:-$(cd "$VERL_WORKSPACE/.." && pwd)}"
+
 
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -14,9 +18,9 @@ export HYDRA_FULL_ERROR=1
 export VERL_PRINT_CONFIG="${VERL_PRINT_CONFIG:-0}"
 export G_OPD_PROGRESS_DEBUG="${G_OPD_PROGRESS_DEBUG:-1}"
 
-cd /workspace/opd1/verl
+cd "$VERL_WORKSPACE"
 
-G_OPD_ENV_FILE="${G_OPD_ENV_FILE:-/workspace/opd1/verl/.env}"
+G_OPD_ENV_FILE="${G_OPD_ENV_FILE:-$VERL_WORKSPACE/.env}"
 if [ -f "$G_OPD_ENV_FILE" ]; then
     case "$-" in
         *x*) G_OPD_RESTORE_XTRACE=1; set +x ;;
@@ -32,8 +36,8 @@ if [ -f "$G_OPD_ENV_FILE" ]; then
     unset G_OPD_RESTORE_XTRACE
 fi
 
-TRAIN_SRC="${TRAIN_SRC:-/workspace/opd1/data/train-00000-of-00001.parquet}"
-TRAIN_FILE="${TRAIN_FILE:-/workspace/opd1/verl/train_verl.parquet}"
+TRAIN_SRC="${TRAIN_SRC:-$OPD_REPO_ROOT/data/train-00000-of-00001.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-$VERL_WORKSPACE/train_verl.parquet}"
 export TRAIN_SRC TRAIN_FILE
 
 AIME26_JSONL="${AIME26_JSONL:-/workspace/G-OPD/data/aime26/test.jsonl}"
@@ -42,6 +46,8 @@ export AIME26_JSONL AIME26_PARQUET
 
 STUDENT_MODEL="${STUDENT_MODEL:-/workspace/models/Qwen3-4B}"
 TEACHER_MODEL="${TEACHER_MODEL:-/workspace/models/Qwen3-4B-Non-Thinking-RL-Math-Step500}"
+STUDENT_MODEL_REPO="${STUDENT_MODEL_REPO:-Qwen/Qwen3-4B}"
+TEACHER_MODEL_REPO="${TEACHER_MODEL_REPO:-Keven16/Qwen3-4B-Non-Thinking-RL-Math-Step500}"
 
 # Single-teacher ExOPD uses a fixed reference/base policy for reward extrapolation.
 # Default: student base reference, matching the paper's default strong-to-weak ExOPD.
@@ -87,12 +93,12 @@ download_hf_repo() {
 
 if [ ! -f "$STUDENT_MODEL/config.json" ]; then
     rm -rf "$STUDENT_MODEL"
-    download_hf_repo Qwen/Qwen3-4B "$STUDENT_MODEL"
+    download_hf_repo "$STUDENT_MODEL_REPO" "$STUDENT_MODEL"
 fi
 
 if [ ! -f "$TEACHER_MODEL/config.json" ]; then
     rm -rf "$TEACHER_MODEL"
-    download_hf_repo Keven16/Qwen3-4B-Non-Thinking-RL-Math-Step500 "$TEACHER_MODEL"
+    download_hf_repo "$TEACHER_MODEL_REPO" "$TEACHER_MODEL"
 fi
 
 if [ ! -f "$EXOPD_REFERENCE_MODEL/config.json" ]; then
@@ -145,7 +151,18 @@ def pick_answer(x):
     )
 
 
+def json_safe(v):
+    if hasattr(v, "tolist"):
+        return json_safe(v.tolist())
+    if isinstance(v, dict):
+        return {str(k): json_safe(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [json_safe(item) for item in v]
+    return v
+
+
 def normalize_prompt(v):
+    v = json_safe(v)
     if isinstance(v, list):
         return v
     if isinstance(v, str):
@@ -169,14 +186,14 @@ def normalize_parquet(src, dst, data_source, split):
         if problem is None:
             raise KeyError(f"{src} row {i} has no prompt/problem/question/input/query field. keys={list(x.keys())}")
 
-        reward_model = x.get("reward_model")
+        reward_model = json_safe(x.get("reward_model"))
         if not isinstance(reward_model, dict):
             reward_model = {
                 "style": "rule",
                 "ground_truth": "" if answer is None else str(answer),
             }
 
-        extra_info = x.get("extra_info")
+        extra_info = json_safe(x.get("extra_info"))
         if not isinstance(extra_info, dict):
             extra_info = {}
 
@@ -184,7 +201,7 @@ def normalize_parquet(src, dst, data_source, split):
             "split": split,
             "index": int(i),
             "answer": "" if answer is None else str(answer),
-            "problem": problem if isinstance(problem, str) else json.dumps(problem, ensure_ascii=False),
+            "problem": problem if isinstance(problem, str) else json.dumps(json_safe(problem), ensure_ascii=False),
         })
 
         rows.append({
@@ -234,7 +251,7 @@ def normalize_jsonl(src, dst, data_source, split):
                     "split": split,
                     "index": i,
                     "answer": "" if answer is None else str(answer),
-                    "problem": problem if isinstance(problem, str) else json.dumps(problem, ensure_ascii=False),
+                    "problem": problem if isinstance(problem, str) else json.dumps(json_safe(problem), ensure_ascii=False),
                 },
             })
 
@@ -300,7 +317,7 @@ python3 -m verl.trainer.main_ppo \
         data.val_files="$AIME26_PARQUET" \
         data.train_batch_size=128 \
         data.max_prompt_length=2048 \
-        data.max_response_length=4096 \
+        data.max_response_length="${G_OPD_MAX_RESPONSE_LENGTH:-2048}" \
         data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.shuffle=True \

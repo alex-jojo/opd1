@@ -13,6 +13,8 @@
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
 
+import os
+
 from verl.utils.import_utils import deprecated
 
 
@@ -76,9 +78,17 @@ def default_compute_score(
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
-    elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
+    elif (
+        data_source in ["codecontests", "apps", "codeforces", "taco"]
+        or data_source.startswith("train-code-")
+        or data_source.startswith("test-code-")
+        or "taco" in data_source.lower()
+        or "leetcode" in data_source.lower()
+    ):
+        if os.environ.get("CODE_CONSTANT_REWARD", "0").lower() in {"1", "true", "yes", "on"}:
+            res = float(os.environ.get("CODE_CONSTANT_REWARD_VALUE", "1.0"))
         # Use the passed sandbox_fusion_url if available
-        if sandbox_fusion_url:
+        elif sandbox_fusion_url:
             from . import sandbox_fusion
 
             # Pass the URL directly, ground_truth likely contains test cases here

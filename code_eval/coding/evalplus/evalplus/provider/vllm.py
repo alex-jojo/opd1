@@ -68,8 +68,7 @@ class VllmDecoder(DecoderBase):
             [prompt] * batch_size,
             SamplingParams(
                 temperature=self.temperature,
-                # max_tokens=self.max_new_tokens,
-                max_tokens=16384,
+                max_tokens=self.max_new_tokens,
                 # top_p=0.95 if do_sample else 1.0,
                 top_p=1.0,
                 # stop=self.eos,
