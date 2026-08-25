@@ -442,6 +442,24 @@ class RayPPOTrainer:
             or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         )
 
+        self.rubric_probe_config = self.config.trainer.get("rubric_probe_data", None)
+        self.collect_rubric_probe_data = bool(
+            self.rubric_probe_config and _is_truthy(self.rubric_probe_config.get("enable", False))
+        )
+        if self.collect_rubric_probe_data:
+            scorer_config = self.config.trainer.get("gpt_rollout_score", None)
+            if not scorer_config or not _is_truthy(scorer_config.get("enable", False)):
+                raise ValueError("rubric_probe_data requires trainer.gpt_rollout_score.enable=True")
+            if not self.use_reference_policy:
+                raise ValueError("rubric_probe_data requires a reference/teacher policy")
+            if str(self.config.actor_rollout_ref.actor.strategy).lower() not in {"fsdp", "fsdp2"}:
+                raise ValueError("rubric_probe_data currently supports FSDP/FSDP2 actor and teacher policies")
+            if self.use_ref_retokenization or self.use_context_distillation or self.use_ref_solution_distillation:
+                raise ValueError(
+                    "rubric_probe_data currently requires standard teacher inputs so the teacher encodes exactly "
+                    "the same student response tokens (no ref re-tokenization or context/ref-solution distillation)"
+                )
+
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
@@ -772,6 +790,34 @@ class RayPPOTrainer:
         return (
             self.tokenizer.decode(valid_prompt_ids.detach().cpu().tolist(), skip_special_tokens=True),
             self.tokenizer.decode(valid_response_ids.detach().cpu().tolist(), skip_special_tokens=True),
+        )
+
+    def _save_rubric_probe_data(self, batch: DataProto, metrics: dict, timing_raw: dict) -> None:
+        if not self.collect_rubric_probe_data:
+            return
+
+        from verl.trainer.ppo.rubric_probe_data import pop_rubric_probe_hidden, save_rubric_probe_batch
+
+        student_checkpoint = str(self.config.actor_rollout_ref.model.path)
+        ref_model_config = self.config.actor_rollout_ref.ref.get("model", {}) or {}
+        teacher_checkpoint = str(ref_model_config.get("path", student_checkpoint))
+        with marked_timer("rubric_probe_data", timing_raw, color="green"):
+            stats = save_rubric_probe_batch(
+                batch=batch,
+                tokenizer=self.tokenizer,
+                config=self.rubric_probe_config,
+                global_step=self.global_steps,
+                student_checkpoint=student_checkpoint,
+                teacher_checkpoint=teacher_checkpoint,
+            )
+        pop_rubric_probe_hidden(batch)
+        batch.meta_info.pop("rubric_probe_return_hidden", None)
+        for key, value in stats.items():
+            metrics[f"rubric_probe_data/{key}"] = int(value)
+        self._debug_progress(
+            f"rubric_probe_data:saved count={stats.get('saved', 0)} "
+            f"invalid_rubric={stats.get('invalid_rubric', 0)} "
+            f"output_dir={self.rubric_probe_config.get('output_dir')}"
         )
 
     def _get_gpt_case_study_low_idxs(
@@ -3578,6 +3624,13 @@ class RayPPOTrainer:
                     #   Note: 蟺_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    if self.collect_rubric_probe_data:
+                        if bypass_recomputing_logprobs:
+                            raise ValueError(
+                                "rubric_probe_data cannot collect student hidden states when "
+                                "algorithm.rollout_correction.bypass_mode=True"
+                            )
+                        batch.meta_info["rubric_probe_return_hidden"] = True
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         self._debug_progress("old_log_prob:skip bypass_mode=true")
                         self._debug_progress("rollout_correction:start mode=bypass")
@@ -3686,6 +3739,10 @@ class RayPPOTrainer:
 
                     if self.use_reference_policy:
                         self._debug_progress("ref_log_prob:done")
+
+                    # Save before rank-gap filtering so all original, non-padding
+                    # rows with valid GPT labels remain in the probe dataset.
+                    self._save_rubric_probe_data(batch=batch, metrics=metrics, timing_raw=timing_raw)
 
                     # Compute base model log probs for corrected reward computation
                     # This computes: base_log_prob from actor's base model (using input_ids)

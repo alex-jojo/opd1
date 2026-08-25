@@ -39,31 +39,39 @@ From the repository root, choose one student size:
 
 ```bash
 # Qwen3-0.6B student
-bash run_three_0.6_code_baselines_sequential_qwen3_4b.sh
+bash code_sequential/run_three_0.6_code_baselines_sequential_qwen3_4b.sh
 
 # Qwen3-1.7B student
-bash run_three_1.7_code_baselines_sequential_qwen3_4b.sh
+bash code_sequential/run_three_1.7_code_baselines_sequential_qwen3_4b.sh
 
 # Qwen3-4B student
-bash run_three_4b_code_baselines_sequential_qwen3_4b.sh
+bash code_sequential/run_three_4b_code_baselines_sequential_qwen3_4b.sh
 ```
 
 Useful overrides:
 
 ```bash
 TOTAL_STEPS=109 SAVE_FREQ=109 KEEP_CKPT=1 \
-  bash run_three_4b_code_baselines_sequential_qwen3_4b.sh
+  bash code_sequential/run_three_4b_code_baselines_sequential_qwen3_4b.sh
 ```
 
 - `KEEP_CKPT=0` (default) removes each checkpoint only after its evaluation
   succeeds; use `KEEP_CKPT=1` to retain checkpoints.
 - `DRY_RUN=1` prints training/evaluation commands without executing them.
 - `RUN_LCB`, `RUN_EVALPLUS`, `RUN_HUMANEVAL`, and `RUN_MBPP` independently
-  enable evaluation components.
-- `LCB_N=8`, `LCB_RELEASE=v5`, `LCB_MAX_TOKENS=2048`, and
-  `EVALPLUS_MAX_TOKENS=2048` reproduce the pipeline defaults.
+  enable evaluation components in the common evaluator. The full sequential
+  pipeline validates that all nine metrics are present, so disabling a
+  component there intentionally makes final validation fail.
+- `LCB_N=8`, `LCB_RELEASE=v5`, and `LCB_MAX_TOKENS=2048` are the common
+  pipeline defaults. The common evaluator defaults `EVALPLUS_MAX_TOKENS` to
+  4096, while the 0.6B pipeline explicitly sets it to 2048; set it explicitly
+  when matched generation lengths are required.
 - Vanilla OPD uses the real code reward for logging. TA-OPD and ExOPD use the
   configured constant reward where required by their baseline definitions.
+
+For a Chinese explanation of the evaluation call chain, datasets, metric
+definitions, standalone checkpoint/base-model commands, and troubleshooting,
+see [CODE_EVALUATION_GUIDE_ZH.md](CODE_EVALUATION_GUIDE_ZH.md).
 
 Each run writes only local artifacts:
 

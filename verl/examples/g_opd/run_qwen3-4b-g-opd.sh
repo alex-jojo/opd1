@@ -349,6 +349,12 @@ GPT_ROLLOUT_SCORE_RANK_GAP_CASE_STUDY_DIR="${GPT_ROLLOUT_SCORE_RANK_GAP_CASE_STU
 GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP="${GPT_ROLLOUT_SCORE_CASE_STUDY_MAX_PER_STEP:-20}"
 GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100="${GPT_ROLLOUT_SCORE_CASE_STUDY_THRESHOLD_100:-$GPT_ROLLOUT_SCORE_MIN_SCORE_100}"
 GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS="${GPT_ROLLOUT_SCORE_CASE_STUDY_INCLUDE_ERRORS:-True}"
+RUBRIC_PROBE_DATA_ENABLE="${RUBRIC_PROBE_DATA_ENABLE:-False}"
+RUBRIC_PROBE_DATA_DIR="${RUBRIC_PROBE_DATA_DIR:-$G_OPD_LOG_DIR/rubric_probe_data}"
+RUBRIC_PROBE_HIDDEN_DTYPE="${RUBRIC_PROBE_HIDDEN_DTYPE:-float16}"
+RUBRIC_PROBE_STUDENT_HIDDEN_SIZE="${RUBRIC_PROBE_STUDENT_HIDDEN_SIZE:-2048}"
+RUBRIC_PROBE_TEACHER_HIDDEN_SIZE="${RUBRIC_PROBE_TEACHER_HIDDEN_SIZE:-2560}"
+RUBRIC_PROBE_PROMPT_VERSION="${RUBRIC_PROBE_PROMPT_VERSION:-math_7rubric_v1}"
 
 case "$GPT_ROLLOUT_SCORE_ENABLE" in
     True|true|1|yes|YES)
@@ -413,6 +419,12 @@ python3 -m verl.trainer.main_ppo \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
         reward_model.reward_manager=naive \
+        trainer.rubric_probe_data.enable="$RUBRIC_PROBE_DATA_ENABLE" \
+        trainer.rubric_probe_data.output_dir="$RUBRIC_PROBE_DATA_DIR" \
+        trainer.rubric_probe_data.hidden_dtype="$RUBRIC_PROBE_HIDDEN_DTYPE" \
+        trainer.rubric_probe_data.expected_student_hidden_size="$RUBRIC_PROBE_STUDENT_HIDDEN_SIZE" \
+        trainer.rubric_probe_data.expected_teacher_hidden_size="$RUBRIC_PROBE_TEACHER_HIDDEN_SIZE" \
+        trainer.rubric_probe_data.rubric_prompt_version="$RUBRIC_PROBE_PROMPT_VERSION" \
         trainer.gpt_rollout_score.enable="$GPT_ROLLOUT_SCORE_ENABLE" \
         trainer.gpt_rollout_score.model="$GPT_ROLLOUT_SCORE_MODEL" \
         trainer.gpt_rollout_score.reasoning_effort="$GPT_ROLLOUT_SCORE_REASONING_EFFORT" \

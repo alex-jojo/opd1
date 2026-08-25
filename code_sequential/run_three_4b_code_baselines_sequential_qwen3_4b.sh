@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 # Qwen3-4B student entry point for the sequential code-baseline pipeline.
+# Keep this wrapper beside the shared 1.7B runner in code_sequential/.
 # The shared runner owns training, evaluation, checkpoint validation, and cleanup;
 # this wrapper only selects the student model and collision-free experiment names.
 

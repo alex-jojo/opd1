@@ -1039,9 +1039,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                compute_result = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if len(compute_result) == 3:
+                    output, entropys, pooled_hidden = compute_result
+                else:
+                    output, entropys = compute_result
+                    pooled_hidden = None
+            output_tensors = {"old_log_probs": output, "entropys": entropys}
+            if pooled_hidden is not None:
+                output_tensors.update(
+                    {
+                        "rubric_probe_student_last": pooled_hidden["last"],
+                        "rubric_probe_student_mean": pooled_hidden["mean"],
+                    }
+                )
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=output_tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
@@ -1066,7 +1079,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data.meta_info["is_lora"] = True
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
+            output_tensors = {"ref_log_prob": data.batch["old_log_probs"]}
+            if "rubric_probe_student_last" in data.batch:
+                output_tensors["rubric_probe_teacher_last"] = data.batch["rubric_probe_student_last"]
+                output_tensors["rubric_probe_teacher_mean"] = data.batch["rubric_probe_student_mean"]
+            data = DataProto.from_dict(tensors=output_tensors)
             return data
         assert self._is_ref
         # else:
@@ -1079,8 +1096,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
+            compute_result = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            if len(compute_result) == 3:
+                output, _, pooled_hidden = compute_result
+            else:
+                output, _ = compute_result
+                pooled_hidden = None
+            output_tensors = {"ref_log_prob": output}
+            if pooled_hidden is not None:
+                output_tensors.update(
+                    {
+                        "rubric_probe_teacher_last": pooled_hidden["last"],
+                        "rubric_probe_teacher_mean": pooled_hidden["mean"],
+                    }
+                )
+            output = DataProto.from_dict(tensors=output_tensors)
 
         output = output.to("cpu")
 

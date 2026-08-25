@@ -241,7 +241,11 @@ sh scripts/run_eval_math.sh
 ```
 
 ### Code Generation Evaluation
-Our evaluation is mainly based on the code provided in [Absolute-Zero-Reasoner](https://github.com/LeapLabTHU/Absolute-Zero-Reasoner). 
+Our evaluation is mainly based on the code provided in [Absolute-Zero-Reasoner](https://github.com/LeapLabTHU/Absolute-Zero-Reasoner).
+
+For the repository's unified checkpoint/base-model evaluator, benchmark logic,
+metrics, configuration, and end-to-end pipeline usage, see the
+[Chinese code evaluation guide](CODE_EVALUATION_GUIDE_ZH.md).
 
 #### EvalPlus
 

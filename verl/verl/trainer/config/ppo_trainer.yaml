@@ -146,6 +146,21 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Collect final-layer response representations and seven-dimensional GPT
+  # rubric labels for downstream linear-probe/MLP training. FSDP actor/ref only.
+  rubric_probe_data:
+    enable: False
+    output_dir: null
+    # Save pooled hidden vectors as FP16 (BF16 is also supported).
+    hidden_dtype: float16
+    # Fail fast if a different model width is accidentally used.
+    expected_student_hidden_size: 2048
+    expected_teacher_hidden_size: 2560
+    # Save problem/response/ground-truth strings in metadata.parquet.
+    save_text: True
+    # Increment this whenever the seven-rubric evaluation prompt changes.
+    rubric_prompt_version: math_7rubric_v1
+
   # Optional GPT scoring for training rollouts. When enabled, low-score rollouts can be rerolled
   # and appended as extra training rows. Rubric ranks can add a bounded advantage shift.
   gpt_rollout_score:

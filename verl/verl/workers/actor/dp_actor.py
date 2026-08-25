@@ -38,6 +38,11 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.hidden_state_pooling import (
+    LastHiddenStateCapture,
+    find_final_norm_module,
+    pool_response_hidden,
+)
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor"]
@@ -119,6 +124,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
         self.param_dtype = PrecisionType.to_dtype(self.config.fsdp_config.get("dtype", "bfloat16"))
+        self._rubric_probe_final_norm = None
         if self.param_dtype == torch.float16:
             from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
@@ -126,13 +132,31 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+    def _forward_with_optional_last_hidden(self, *, return_last_hidden: bool, **model_inputs):
+        if not return_last_hidden:
+            return self.actor_module(**model_inputs), None
+
+        if self._rubric_probe_final_norm is None:
+            norm_name, self._rubric_probe_final_norm = find_final_norm_module(self.actor_module)
+            if torch.distributed.get_rank() == 0:
+                print(f"Rubric-probe hidden capture uses final norm module: {norm_name}")
+
+        with LastHiddenStateCapture(self._rubric_probe_final_norm) as capture:
+            output = self.actor_module(**model_inputs)
+        return output, capture.take()
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        return_last_hidden=False,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            pooled_hidden: optional ``last`` and ``mean`` final-layer response vectors
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -146,6 +170,9 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            response_mask = micro_batch.get("response_mask")
+            if return_last_hidden and response_mask is None:
+                response_mask = attention_mask[:, -response_length:]
             # reset input_ids, attention_mask, position_ids to ref model inputs if ref model input_ids is different from actor input_ids
             if "ref_input_ids" in micro_batch.keys():
                 input_ids = micro_batch["ref_input_ids"]
@@ -217,7 +244,8 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output, last_hidden_rmpad = self._forward_with_optional_last_hidden(
+                    return_last_hidden=return_last_hidden,
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
@@ -225,6 +253,38 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+
+                pooled_hidden = None
+                if return_last_hidden:
+                    while last_hidden_rmpad.ndim > 2 and last_hidden_rmpad.shape[0] == 1:
+                        last_hidden_rmpad = last_hidden_rmpad.squeeze(0)
+                    if last_hidden_rmpad.ndim != 2:
+                        raise RuntimeError(
+                            "Expected unpadded final hidden states with shape [tokens, hidden], "
+                            f"got {tuple(last_hidden_rmpad.shape)}"
+                        )
+                    if self.use_ulysses_sp:
+                        last_hidden_rmpad = gather_outputs_and_unpad(
+                            last_hidden_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    full_last_hidden = pad_input(
+                        hidden_states=last_hidden_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    response_hidden = full_last_hidden[:, -response_length:, :]
+                    last, mean = pool_response_hidden(
+                        response_hidden,
+                        response_mask,
+                        inplace_mask=True,
+                        allow_empty=True,
+                    )
+                    pooled_hidden = {"last": last, "mean": mean}
+                    del full_last_hidden, response_hidden, last_hidden_rmpad
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -295,7 +355,8 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output, last_hidden = self._forward_with_optional_last_hidden(
+                    return_last_hidden=return_last_hidden,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -303,6 +364,23 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+
+                pooled_hidden = None
+                if return_last_hidden:
+                    if last_hidden.ndim != 3:
+                        raise RuntimeError(
+                            "Expected padded final hidden states with shape [batch, tokens, hidden], "
+                            f"got {tuple(last_hidden.shape)}"
+                        )
+                    response_hidden = last_hidden[:, -response_length:, :]
+                    last, mean = pool_response_hidden(
+                        response_hidden,
+                        response_mask,
+                        inplace_mask=True,
+                        allow_empty=True,
+                    )
+                    pooled_hidden = {"last": last, "mean": mean}
+                    del response_hidden, last_hidden
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -320,7 +398,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, pooled_hidden
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -373,9 +451,12 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        return_last_hidden = bool(data.meta_info.get("rubric_probe_return_hidden", False))
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         has_ref_input_ids = "ref_input_ids" in data.batch.keys() # handle when ref input_ids is different from actor input_ids
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if return_last_hidden and "response_mask" in data.batch.keys():
+            select_keys.append("response_mask")
         if has_ref_input_ids:
             select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -390,27 +471,47 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        hidden_last_lst = []
+        hidden_mean_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, pooled_hidden = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    return_last_hidden=return_last_hidden,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if return_last_hidden:
+                hidden_last_lst.append(pooled_hidden["last"])
+                hidden_mean_lst.append(pooled_hidden["mean"])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        pooled_hidden = None
+        if return_last_hidden:
+            pooled_hidden = {
+                "last": torch.concat(hidden_last_lst, dim=0),
+                "mean": torch.concat(hidden_mean_lst, dim=0),
+            }
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if return_last_hidden:
+                pooled_hidden = {
+                    key: restore_dynamic_batch(value, batch_idx_list) for key, value in pooled_hidden.items()
+                }
 
+        if return_last_hidden:
+            return log_probs, entropys, pooled_hidden
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -512,7 +613,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
